@@ -6,7 +6,7 @@ const path = require('path');
 const stream = require('stream');
 const crypto = require('crypto');
 const mime = require('mime-types');
-const archiver = require('archiver');
+const { ZipArchive } = require('archiver');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -384,33 +384,63 @@ app.get('/api/download-zip', async (req, res) => {
   const sessionId = req.headers['x-session-id'] || req.query.sessionId;
   const folderPath = req.query.path || '/';
 
+  let transferClient = null;
+  let usingTempClient = false;
+  let archive = null;
+  let session = null;
+
   try {
-    const session = await getFtpClient(sessionId);
+    session = await getFtpClient(sessionId);
     const folderName = path.posix.basename(folderPath) || 'ftp-archive';
     const zipFilename = `${folderName}.zip`;
 
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(zipFilename)}"`);
+    // Open a dedicated FTP connection so browsing doesn't collide; fall back to session client if limited
+    const tempClient = new ftp.Client(30000);
+    tempClient.ftp.verbose = false;
+    try {
+      await tempClient.access({
+        host: session.config.host,
+        port: session.config.port || 21,
+        user: session.config.user || 'anonymous',
+        password: session.config.password || '',
+        secure: session.config.secure || false,
+        secureOptions: { rejectUnauthorized: false }
+      });
+      transferClient = tempClient;
+      usingTempClient = true;
+    } catch (connErr) {
+      try { tempClient.close(); } catch (e) {}
+      transferClient = session.client;
+    }
 
-    const archive = archiver('zip', { zlib: { level: 6 } });
-    archive.on('error', err => {
-      throw err;
-    });
-    archive.pipe(res);
+    // Verify target folder exists and is readable before sending response headers
+    await transferClient.cd(folderPath);
 
     addLog(session, 'command', `ZIP ${folderPath} (arşiv oluşturuluyor...)`);
 
+    archive = new ZipArchive({ zlib: { level: 6 } });
+    archive.on('error', err => {
+      console.error('ZipArchive stream error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: err.message });
+      } else {
+        res.end();
+      }
+    });
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(zipFilename)}"`);
+    archive.pipe(res);
+
     async function addFolderToZip(remoteDir, zipPrefix = '') {
-      const list = await session.client.list(remoteDir);
+      await transferClient.cd(remoteDir);
+      const list = await transferClient.list();
+
+      // Append files inside remoteDir first
       for (const item of list) {
         if (item.name === '.' || item.name === '..') continue;
-        const itemRemotePath = path.posix.join(remoteDir, item.name);
-        const itemZipPath = zipPrefix ? `${zipPrefix}/${item.name}` : item.name;
-
-        if (item.isDirectory) {
-          archive.append(null, { name: itemZipPath + '/' });
-          await addFolderToZip(itemRemotePath, itemZipPath);
-        } else {
+        if (!item.isDirectory && !item.isSymbolicLink) {
+          const itemZipPath = zipPrefix ? `${zipPrefix}/${item.name}` : item.name;
           const chunks = [];
           const writable = new stream.Writable({
             write(chunk, encoding, callback) {
@@ -418,20 +448,47 @@ app.get('/api/download-zip', async (req, res) => {
               callback();
             }
           });
-          await session.client.downloadTo(writable, itemRemotePath);
+          await transferClient.downloadTo(writable, item.name);
           archive.append(Buffer.concat(chunks), { name: itemZipPath });
+        }
+      }
+
+      // Recurse into subdirectories
+      for (const item of list) {
+        if (item.name === '.' || item.name === '..') continue;
+        if (item.isDirectory) {
+          const itemRemotePath = path.posix.join(remoteDir, item.name);
+          const itemZipPath = zipPrefix ? `${zipPrefix}/${item.name}` : item.name;
+          archive.append(null, { name: itemZipPath + '/' });
+          await addFolderToZip(itemRemotePath, itemZipPath);
         }
       }
     }
 
     await addFolderToZip(folderPath);
     await archive.finalize();
-    await session.client.cd(session.currentDir);
 
     addLog(session, 'success', `"${zipFilename}" ZIP arşivi indirildi.`);
   } catch (err) {
+    console.error('Download ZIP error:', err);
+    if (session) {
+      addLog(session, 'error', `ZIP indirme hatası: ${err.message}`);
+    }
     if (!res.headersSent) {
+      res.removeHeader('Content-Disposition');
+      res.removeHeader('Content-Type');
       return res.status(500).json({ success: false, error: err.message });
+    } else {
+      if (archive) {
+        try { archive.abort(); } catch (e) {}
+      }
+      res.end();
+    }
+  } finally {
+    if (usingTempClient && transferClient) {
+      try { transferClient.close(); } catch (e) {}
+    } else if (session && session.client && !session.client.closed) {
+      try { await session.client.cd(session.currentDir); } catch (e) {}
     }
   }
 });

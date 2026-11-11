@@ -1293,11 +1293,38 @@ function loadTestFtpCredentials() {
 }
 
 // Download Folder as ZIP Archive
-function downloadFolderAsZip(folderName) {
+async function downloadFolderAsZip(folderName) {
   if (!currentSession) return;
   const folderPath = (currentPath === '/' ? '' : currentPath) + '/' + folderName;
-  showToast(`"${folderName}.zip" arşivi hazırlanıyor...`, 'info');
-  window.open(`/api/download-zip?path=${encodeURIComponent(folderPath)}&sessionId=${currentSession.sessionId}`, '_blank');
+  showToast(`"${folderName}.zip" arşivi sunucuda hazırlanıyor...`, 'info');
+
+  try {
+    const res = await fetch(`/api/download-zip?path=${encodeURIComponent(folderPath)}`, {
+      headers: { 'x-session-id': currentSession.sessionId }
+    });
+
+    if (!res.ok) {
+      let errMsg = 'ZIP arşivi oluşturulamadı.';
+      try {
+        const errData = await res.json();
+        if (errData.error) errMsg = errData.error;
+      } catch (e) {}
+      throw new Error(errMsg);
+    }
+
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${folderName}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    showToast(`"${folderName}.zip" indirildi.`, 'success');
+  } catch (err) {
+    showToast(`ZIP indirme hatası: ${err.message}`, 'error');
+  }
 }
 
 // Multi-selection & Batch Delete Functions
