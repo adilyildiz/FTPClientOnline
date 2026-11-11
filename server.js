@@ -451,6 +451,69 @@ app.post('/api/save', async (req, res) => {
   }
 });
 
+// Check if target files already exist (FileZilla-style overwrite detection)
+app.post('/api/check-exists', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  const { paths } = req.body;
+
+  if (!paths || !Array.isArray(paths)) {
+    return res.status(400).json({ success: false, error: 'Dosya listesi (paths) gereklidir.' });
+  }
+
+  try {
+    const session = await getFtpClient(sessionId);
+    const conflicts = [];
+
+    // Group files by parent directory to optimize FTP LIST calls
+    const dirsToCheck = new Map();
+
+    for (const relPath of paths) {
+      const normalized = relPath.replace(/\\/g, '/');
+      const dir = path.posix.dirname(normalized);
+      const filename = path.posix.basename(normalized);
+      const fullDir = (dir && dir !== '.' && dir !== '/')
+        ? path.posix.join(session.currentDir, dir)
+        : session.currentDir;
+
+      if (!dirsToCheck.has(fullDir)) {
+        dirsToCheck.set(fullDir, []);
+      }
+      dirsToCheck.get(fullDir).push({ relPath: normalized, filename });
+    }
+
+    for (const [fullDir, files] of dirsToCheck.entries()) {
+      try {
+        const list = await session.client.list(fullDir);
+        const map = new Map();
+        list.forEach(item => map.set(item.name, item));
+
+        for (const { relPath, filename } of files) {
+          if (map.has(filename)) {
+            const item = map.get(filename);
+            conflicts.push({
+              relativePath: relPath,
+              filename,
+              exists: true,
+              size: item.size,
+              modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : (item.rawModifiedAt || null),
+              isDirectory: item.isDirectory
+            });
+          }
+        }
+      } catch (dirErr) {
+        // If directory doesn't exist on FTP yet, no files exist in it
+      }
+    }
+
+    // Ensure we are back in working dir
+    await session.client.cd(session.currentDir);
+
+    return res.json({ success: true, conflicts });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Upload File(s) with folder / relative path support
 app.post('/api/upload', upload.array('files'), async (req, res) => {
   const sessionId = req.headers['x-session-id'];

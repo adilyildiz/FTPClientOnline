@@ -756,8 +756,25 @@ function handleFolderUpload(e) {
 }
 
 // Upload Items in safe batches (handles folders, nested paths, and avoids Cloud Run 32MB payload limit)
-async function uploadItems(items) {
-  if (!currentSession || !items || items.length === 0) return;
+async function uploadItems(rawItems) {
+  if (!currentSession || !rawItems || rawItems.length === 0) return;
+
+  // FileZilla-style conflict pre-check and overwrite resolution
+  let items = rawItems;
+  try {
+    items = await resolveConflicts(rawItems);
+  } catch (err) {
+    if (err.message === 'cancelled') {
+      showToast('Yükleme işlemi iptal edildi.', 'info');
+      return;
+    }
+    console.error('Çakışma denetimi hatası:', err);
+  }
+
+  if (!items || items.length === 0) {
+    showToast('Tüm çakışan dosyalar atlandı veya yüklenecek dosya kalmadı.', 'info');
+    return;
+  }
 
   const progressBar = document.getElementById('uploadProgressBar');
   const progressFill = document.getElementById('uploadProgressFill');
@@ -814,6 +831,153 @@ async function uploadItems(items) {
       progressBar.classList.add('hidden');
     }, 1200);
   }
+}
+
+// FileZilla-style Overwrite / Conflict Resolution Helper
+async function resolveConflicts(items) {
+  if (!items || items.length === 0) return items;
+
+  try {
+    const res = await fetch('/api/check-exists', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-session-id': currentSession.sessionId
+      },
+      body: JSON.stringify({ paths: items.map(i => i.relativePath) })
+    });
+
+    const data = await res.json();
+    if (!data.success || !data.conflicts || data.conflicts.length === 0) {
+      return items; // No conflicts found! Proceed directly.
+    }
+
+    const conflicts = data.conflicts;
+    let rememberedAction = null;
+    const finalItems = [];
+    const allPaths = items.map(i => i.relativePath);
+
+    for (let k = 0; k < conflicts.length; k++) {
+      const conflict = conflicts[k];
+      const sourceItem = items.find(i => i.relativePath === conflict.relativePath);
+      if (!sourceItem) continue;
+
+      let action = rememberedAction;
+
+      if (!action) {
+        // Prompt user with FileZilla Overwrite Modal
+        const result = await promptOverwriteModal(conflict, sourceItem, k + 1, conflicts.length);
+        if (result.applyToAll) {
+          rememberedAction = result.type;
+        }
+        action = result.type;
+      }
+
+      // Process action
+      if (action === 'skip') {
+        // Skip file
+        continue;
+      } else if (action === 'overwrite') {
+        finalItems.push(sourceItem);
+      } else if (action === 'overwrite_diff') {
+        // Overwrite if size differs
+        if (sourceItem.file.size !== conflict.size) {
+          finalItems.push(sourceItem);
+        } else {
+          console.log(`Boyutu aynı olduğu için atlandı: ${sourceItem.relativePath}`);
+        }
+      } else if (action === 'rename') {
+        const newRelPath = getRenamedPath(sourceItem.relativePath, allPaths);
+        allPaths.push(newRelPath);
+        finalItems.push({
+          file: sourceItem.file,
+          relativePath: newRelPath
+        });
+      }
+    }
+
+    // Include all items that had NO conflicts
+    const conflictRelPaths = new Set(conflicts.map(c => c.relativePath));
+    for (const item of items) {
+      if (!conflictRelPaths.has(item.relativePath)) {
+        finalItems.push(item);
+      }
+    }
+
+    return finalItems;
+  } catch (err) {
+    if (err.message === 'cancelled') throw err;
+    console.error('Conflict check error:', err);
+    return items;
+  }
+}
+
+// Show FileZilla-style Overwrite Modal and await user decision
+function promptOverwriteModal(conflict, sourceItem, currentNum, totalNum) {
+  return new Promise((resolve, reject) => {
+    const modal = document.getElementById('overwriteModal');
+    const filenameEl = document.getElementById('overwriteFilename');
+    const badgeEl = document.getElementById('overwriteCounterBadge');
+    const targetSizeEl = document.getElementById('targetFileSize');
+    const targetDateEl = document.getElementById('targetFileDate');
+    const sourceSizeEl = document.getElementById('sourceFileSize');
+    const sourceDateEl = document.getElementById('sourceFileDate');
+    const confirmBtn = document.getElementById('overwriteConfirmBtn');
+    const cancelBtn = document.getElementById('overwriteCancelQueueBtn');
+    const applyToAllCheck = document.getElementById('overwriteApplyToAll');
+
+    filenameEl.innerText = conflict.relativePath;
+    badgeEl.innerText = `${currentNum} / ${totalNum}`;
+    targetSizeEl.innerText = formatBytes(conflict.size);
+    targetDateEl.innerText = conflict.modifiedAt ? new Date(conflict.modifiedAt).toLocaleString('tr-TR') : '-';
+    sourceSizeEl.innerText = formatBytes(sourceItem.file.size);
+    sourceDateEl.innerText = new Date(sourceItem.file.lastModified).toLocaleString('tr-TR');
+
+    // Reset default checkbox
+    applyToAllCheck.checked = false;
+
+    modal.classList.remove('hidden');
+
+    function cleanup() {
+      modal.classList.add('hidden');
+      confirmBtn.removeEventListener('click', onConfirm);
+      cancelBtn.removeEventListener('click', onCancel);
+    }
+
+    function onConfirm() {
+      const selectedRadio = document.querySelector('input[name="overwriteAction"]:checked');
+      const actionType = selectedRadio ? selectedRadio.value : 'overwrite';
+      const applyToAll = applyToAllCheck.checked;
+      cleanup();
+      resolve({ type: actionType, applyToAll });
+    }
+
+    function onCancel() {
+      cleanup();
+      reject(new Error('cancelled'));
+    }
+
+    confirmBtn.addEventListener('click', onConfirm);
+    cancelBtn.addEventListener('click', onCancel);
+  });
+}
+
+// Generate unique renamed path e.g. "image (1).png"
+function getRenamedPath(originalRelPath, existingPaths) {
+  const parts = originalRelPath.split('/');
+  const filename = parts.pop();
+  const dir = parts.join('/');
+  const dotIndex = filename.lastIndexOf('.');
+  const baseName = dotIndex !== -1 ? filename.substring(0, dotIndex) : filename;
+  const ext = dotIndex !== -1 ? filename.substring(dotIndex) : '';
+
+  let counter = 1;
+  let candidate = dir ? `${dir}/${baseName} (${counter})${ext}` : `${baseName} (${counter})${ext}`;
+  while (existingPaths.includes(candidate)) {
+    counter++;
+    candidate = dir ? `${dir}/${baseName} (${counter})${ext}` : `${baseName} (${counter})${ext}`;
+  }
+  return candidate;
 }
 
 // Drag & Drop Setup (Handles both files and deeply nested folders)
