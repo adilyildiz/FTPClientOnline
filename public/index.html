@@ -220,7 +220,10 @@
       <table class="w-full text-left border-collapse text-xs">
         <thead class="bg-slate-950/70 sticky top-0 z-10 border-b border-slate-800 text-slate-400 font-semibold tracking-wider uppercase text-[11px]">
           <tr>
-            <th class="py-2.5 px-4 cursor-pointer hover:text-white" onclick="sortFiles('name')">
+            <th class="py-2.5 pl-4 pr-1 w-8 text-center">
+              <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this)" class="rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer">
+            </th>
+            <th class="py-2.5 px-3 cursor-pointer hover:text-white" onclick="sortFiles('name')">
               İsim <i class="fa-solid fa-sort ml-1 text-slate-600" id="sort-name"></i>
             </th>
             <th class="py-2.5 px-4 w-28 cursor-pointer hover:text-white text-right" onclick="sortFiles('size')">
@@ -230,13 +233,28 @@
             <th class="py-2.5 px-4 w-44 cursor-pointer hover:text-white" onclick="sortFiles('modifiedAt')">
               Değiştirilme <i class="fa-solid fa-sort ml-1 text-slate-600" id="sort-modifiedAt"></i>
             </th>
-            <th class="py-2.5 px-4 w-40 text-right">İşlemler</th>
+            <th class="py-2.5 px-4 w-44 text-right">İşlemler</th>
           </tr>
         </thead>
         <tbody id="fileListBody" class="divide-y divide-slate-800/60 font-mono">
           <!-- Dynamic File rows injected here -->
         </tbody>
       </table>
+    </div>
+
+    <!-- Bulk Selection Floating Bar -->
+    <div id="bulkActionBar" class="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-900/95 backdrop-blur border border-slate-700 rounded-full px-4 py-2 shadow-2xl z-30 hidden flex items-center gap-4 text-xs">
+      <span class="font-semibold text-sky-400 flex items-center gap-1.5">
+        <i class="fa-solid fa-check-double"></i>
+        <span id="selectedCountText">0 öğe seçildi</span>
+      </span>
+      <div class="h-4 w-px bg-slate-700"></div>
+      <button onclick="deleteSelectedItems()" class="text-rose-400 hover:text-rose-300 font-medium flex items-center gap-1.5 transition">
+        <i class="fa-solid fa-trash-can"></i> Seçilenleri Sil
+      </button>
+      <button onclick="clearSelection()" class="text-slate-400 hover:text-white flex items-center gap-1 transition">
+        <i class="fa-solid fa-xmark"></i> Vazgeç
+      </button>
     </div>
 
     <!-- Upload Progress Floating Bar -->
@@ -518,6 +536,13 @@
           </button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Custom Right-Click Context Menu -->
+  <div id="contextMenu" class="fixed bg-slate-900 border border-slate-700/90 rounded-xl shadow-2xl py-1.5 w-48 z-50 hidden text-xs backdrop-blur">
+    <div id="contextMenuItems" class="space-y-0.5 px-1">
+      <!-- Dynamic items injected via JS -->
     </div>
   </div>
 

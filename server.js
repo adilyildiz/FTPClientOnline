@@ -6,6 +6,7 @@ const path = require('path');
 const stream = require('stream');
 const crypto = require('crypto');
 const mime = require('mime-types');
+const archiver = require('archiver');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -344,6 +345,94 @@ app.post('/api/delete', async (req, res) => {
     return res.json({ success: true, message: 'Öğe başarıyla silindi.' });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Batch Delete Files and Directories
+app.post('/api/delete-batch', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  const { items } = req.body;
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, error: 'Silinecek öğe seçilmedi.' });
+  }
+
+  try {
+    const session = await getFtpClient(sessionId);
+    let deletedCount = 0;
+
+    for (const item of items) {
+      if (item.isDirectory) {
+        addLog(session, 'command', `RMD ${item.path} (toplu silme)`);
+        await session.client.removeDir(item.path);
+      } else {
+        addLog(session, 'command', `DELE ${item.path} (toplu silme)`);
+        await session.client.remove(item.path);
+      }
+      deletedCount++;
+    }
+
+    addLog(session, 'success', `Toplam ${deletedCount} öğe silindi.`);
+    return res.json({ success: true, message: `${deletedCount} öğe başarıyla silindi.` });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Download Folder as ZIP archive
+app.get('/api/download-zip', async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || req.query.sessionId;
+  const folderPath = req.query.path || '/';
+
+  try {
+    const session = await getFtpClient(sessionId);
+    const folderName = path.posix.basename(folderPath) || 'ftp-archive';
+    const zipFilename = `${folderName}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(zipFilename)}"`);
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('error', err => {
+      throw err;
+    });
+    archive.pipe(res);
+
+    addLog(session, 'command', `ZIP ${folderPath} (arşiv oluşturuluyor...)`);
+
+    async function addFolderToZip(remoteDir, zipPrefix = '') {
+      const list = await session.client.list(remoteDir);
+      for (const item of list) {
+        if (item.name === '.' || item.name === '..') continue;
+        const itemRemotePath = path.posix.join(remoteDir, item.name);
+        const itemZipPath = zipPrefix ? `${zipPrefix}/${item.name}` : item.name;
+
+        if (item.isDirectory) {
+          archive.append(null, { name: itemZipPath + '/' });
+          await addFolderToZip(itemRemotePath, itemZipPath);
+        } else {
+          const chunks = [];
+          const writable = new stream.Writable({
+            write(chunk, encoding, callback) {
+              chunks.push(chunk);
+              callback();
+            }
+          });
+          await session.client.downloadTo(writable, itemRemotePath);
+          archive.append(Buffer.concat(chunks), { name: itemZipPath });
+        }
+      }
+    }
+
+    await addFolderToZip(folderPath);
+    await archive.finalize();
+    await session.client.cd(session.currentDir);
+
+    addLog(session, 'success', `"${zipFilename}" ZIP arşivi indirildi.`);
+  } catch (err) {
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
   }
 });
 

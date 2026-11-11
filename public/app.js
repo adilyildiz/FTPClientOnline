@@ -7,6 +7,7 @@ let sortField = 'name';
 let sortDirection = 'asc';
 let logPollInterval = null;
 let currentEditingPath = null;
+let selectedNames = new Set();
 
 // Initialize on DOM load
 document.addEventListener('DOMContentLoaded', () => {
@@ -49,6 +50,20 @@ function setupEventListeners() {
 
   // Bookmarks modal button
   document.getElementById('openBookmarksBtn').addEventListener('click', () => openModal('bookmarksModal'));
+
+  // Context Menu dismiss handlers
+  document.addEventListener('click', () => hideContextMenu());
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideContextMenu();
+  });
+
+  // Right-click on empty explorer table container
+  document.getElementById('explorerTableContainer').addEventListener('contextmenu', (e) => {
+    if (!currentSession) return;
+    if (e.target.closest('tr')) return; // handled by row listener
+    e.preventDefault();
+    showEmptyAreaContextMenu(e);
+  });
 
   // Drag and Drop support
   setupDragAndDrop();
@@ -236,6 +251,7 @@ async function loadDirectory(path) {
 
     currentPath = data.currentDir;
     fileList = data.files || [];
+    clearSelection();
 
     renderBreadcrumb(currentPath);
     renderFileList();
@@ -353,7 +369,7 @@ function renderFileList(filterQuery = '') {
   if (filtered.length === 0) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="5" class="py-8 text-center text-slate-500 font-sans">
+        <td colspan="6" class="py-8 text-center text-slate-500 font-sans">
           <i class="fa-regular fa-folder-open text-2xl mb-2 block text-slate-600"></i>
           Bu klasörde görüntülenecek dosya yok.
         </td>
@@ -363,7 +379,8 @@ function renderFileList(filterQuery = '') {
 
   filtered.forEach(file => {
     const tr = document.createElement('tr');
-    tr.className = 'hover:bg-slate-800/40 border-b border-slate-800/40 transition group';
+    const isSelected = selectedNames.has(file.name);
+    tr.className = `${isSelected ? 'bg-sky-950/40' : 'hover:bg-slate-800/40'} border-b border-slate-800/40 transition group`;
 
     const iconHtml = getFileIcon(file);
     const sizeStr = file.isDirectory ? '-' : formatBytes(file.size);
@@ -371,7 +388,11 @@ function renderFileList(filterQuery = '') {
     const permBadge = formatPermissions(file.permissions);
 
     tr.innerHTML = `
-      <td class="py-2.5 px-4 flex items-center gap-2.5 overflow-hidden">
+      <td class="py-2.5 pl-4 pr-1 text-center">
+        <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRowSelection('${escapeHtml(file.name)}', this)"
+          class="row-checkbox rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer">
+      </td>
+      <td class="py-2.5 px-3 flex items-center gap-2.5 overflow-hidden">
         ${iconHtml}
         <span class="truncate font-medium ${file.isDirectory ? 'text-sky-300 font-semibold cursor-pointer hover:underline' : 'text-slate-200 cursor-pointer hover:text-white'}"
           title="${escapeHtml(file.name)}">
@@ -385,14 +406,18 @@ function renderFileList(filterQuery = '') {
       <td class="py-2.5 px-4 text-slate-400 text-[11px] whitespace-nowrap">${dateStr}</td>
       <td class="py-2.5 px-4 text-right whitespace-nowrap">
         <div class="inline-flex items-center gap-1 opacity-80 group-hover:opacity-100 transition">
-          ${!file.isDirectory ? `
+          ${file.isDirectory ? `
+            <button onclick="downloadFolderAsZip('${escapeHtml(file.name)}')" title="ZIP Olarak İndir" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
+              <i class="fa-solid fa-file-zipper text-xs"></i>
+            </button>
+          ` : `
             <button onclick="downloadFile('${escapeHtml(file.name)}')" title="İndir" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-emerald-400 flex items-center justify-center transition">
               <i class="fa-solid fa-download text-xs"></i>
             </button>
             <button onclick="openFilePreview('${escapeHtml(file.name)}')" title="Görüntüle / Düzenle" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-sky-400 flex items-center justify-center transition">
               <i class="fa-solid fa-pen-to-square text-xs"></i>
             </button>
-          ` : ''}
+          `}
           <button onclick="openRenameModal('${escapeHtml(file.name)}')" title="Yeniden Adlandır" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
             <i class="fa-solid fa-pen text-xs"></i>
           </button>
@@ -407,13 +432,19 @@ function renderFileList(filterQuery = '') {
     `;
 
     // Row click: click on row text to enter folder or view file
-    const nameSpan = tr.querySelector('td:first-child span');
+    const nameSpan = tr.querySelector('td:nth-child(2) span');
     nameSpan.addEventListener('click', () => {
       if (file.isDirectory) {
         changeDirectory(file.name);
       } else {
         openFilePreview(file.name);
       }
+    });
+
+    // Right-click context menu on row
+    tr.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showContextMenu(e, file);
     });
 
     tbody.appendChild(tr);
@@ -1251,14 +1282,205 @@ function deleteBookmark(index) {
   showToast('Kayıt silindi.', 'info');
 }
 
-// Helper: DLPTest FTP Credentials
+// Helper: Public Test FTP Server Credentials from https://dlptest.com/ftp-test/
 function loadTestFtpCredentials() {
   document.getElementById('hostInput').value = 'ftp.dlptest.com';
   document.getElementById('portInput').value = '21';
   document.getElementById('userInput').value = 'dlpuser';
   document.getElementById('passwordInput').value = 'rNrKYTX9g7z3RgJRmxWuGHbeu';
   document.getElementById('secureCheck').checked = false;
-  showToast('Örnek DLPTest FTP bilgileri dolduruldu. "Hızlı Bağlan" butonuna tıklayabilirsiniz.', 'info');
+  showToast('Halka açık DLPTest FTP test sunucusu bilgileri dolduruldu. "Hızlı Bağlan" butonuna tıklayabilirsiniz.', 'info');
+}
+
+// Download Folder as ZIP Archive
+function downloadFolderAsZip(folderName) {
+  if (!currentSession) return;
+  const folderPath = (currentPath === '/' ? '' : currentPath) + '/' + folderName;
+  showToast(`"${folderName}.zip" arşivi hazırlanıyor...`, 'info');
+  window.open(`/api/download-zip?path=${encodeURIComponent(folderPath)}&sessionId=${currentSession.sessionId}`, '_blank');
+}
+
+// Multi-selection & Batch Delete Functions
+function toggleRowSelection(name, checkbox) {
+  if (checkbox.checked) {
+    selectedNames.add(name);
+  } else {
+    selectedNames.delete(name);
+  }
+  updateBulkActionBar();
+  // Highlight row visually
+  const row = checkbox.closest('tr');
+  if (row) {
+    if (checkbox.checked) {
+      row.classList.add('bg-sky-950/40');
+      row.classList.remove('hover:bg-slate-800/40');
+    } else {
+      row.classList.remove('bg-sky-950/40');
+      row.classList.add('hover:bg-slate-800/40');
+    }
+  }
+}
+
+function toggleSelectAll(masterCheckbox) {
+  const checkboxes = document.querySelectorAll('.row-checkbox');
+  selectedNames.clear();
+  checkboxes.forEach(cb => {
+    cb.checked = masterCheckbox.checked;
+    const row = cb.closest('tr');
+    const nameSpan = row?.querySelector('td:nth-child(2) span');
+    const name = nameSpan?.getAttribute('title');
+    if (masterCheckbox.checked && name) {
+      selectedNames.add(name);
+      row.classList.add('bg-sky-950/40');
+    } else if (row) {
+      row.classList.remove('bg-sky-950/40');
+    }
+  });
+  updateBulkActionBar();
+}
+
+function clearSelection() {
+  selectedNames.clear();
+  const masterCheckbox = document.getElementById('selectAllCheckbox');
+  if (masterCheckbox) masterCheckbox.checked = false;
+  document.querySelectorAll('.row-checkbox').forEach(cb => {
+    cb.checked = false;
+    cb.closest('tr')?.classList.remove('bg-sky-950/40');
+  });
+  updateBulkActionBar();
+}
+
+function updateBulkActionBar() {
+  const bar = document.getElementById('bulkActionBar');
+  const countText = document.getElementById('selectedCountText');
+  if (!bar) return;
+
+  if (selectedNames.size > 0) {
+    countText.innerText = `${selectedNames.size} öğe seçildi`;
+    bar.classList.remove('hidden');
+  } else {
+    bar.classList.add('hidden');
+  }
+}
+
+async function deleteSelectedItems() {
+  if (!currentSession || selectedNames.size === 0) return;
+
+  if (!confirm(`Seçili ${selectedNames.size} öğeyi (ve alt klasörlerini) kalıcı olarak silmek istediğinize emin misiniz?`)) {
+    return;
+  }
+
+  const itemsToDelete = [];
+  selectedNames.forEach(name => {
+    const fileObj = fileList.find(f => f.name === name);
+    if (fileObj) {
+      itemsToDelete.push({ path: fileObj.name, isDirectory: fileObj.isDirectory });
+    }
+  });
+
+  try {
+    const res = await fetch('/api/delete-batch', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-session-id': currentSession.sessionId
+      },
+      body: JSON.stringify({ items: itemsToDelete })
+    });
+
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
+
+    showToast(`${itemsToDelete.length} öğe başarıyla silindi.`, 'success');
+    clearSelection();
+    refreshFiles();
+  } catch (err) {
+    showToast(`Toplu silme hatası: ${err.message}`, 'error');
+  }
+}
+
+// Custom Right-Click Context Menu
+function showContextMenu(e, file) {
+  const menu = document.getElementById('contextMenu');
+  const itemsContainer = document.getElementById('contextMenuItems');
+  if (!menu || !itemsContainer) return;
+
+  const safeName = escapeHtml(file.name);
+  let html = '';
+
+  if (file.isDirectory) {
+    html += `
+      <button onclick="changeDirectory('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+        <i class="fa-solid fa-folder-open text-amber-400 w-4"></i> Klasörü Aç
+      </button>
+      <button onclick="downloadFolderAsZip('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+        <i class="fa-solid fa-file-zipper text-emerald-400 w-4"></i> ZIP Olarak İndir
+      </button>`;
+  } else {
+    html += `
+      <button onclick="openFilePreview('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+        <i class="fa-solid fa-pen-to-square text-sky-400 w-4"></i> Düzenle / Önizle
+      </button>
+      <button onclick="downloadFile('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+        <i class="fa-solid fa-download text-emerald-400 w-4"></i> İndir
+      </button>`;
+  }
+
+  html += `
+    <div class="my-1 border-t border-slate-800"></div>
+    <button onclick="openRenameModal('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-pen text-amber-400 w-4"></i> Yeniden Adlandır
+    </button>
+    <button onclick="openChmodModal('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-key text-purple-400 w-4"></i> İzinler (CHMOD)
+    </button>
+    <div class="my-1 border-t border-slate-800"></div>
+    <button onclick="deleteItem('${safeName}', ${file.isDirectory}); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 flex items-center gap-2 transition">
+      <i class="fa-solid fa-trash-can w-4"></i> Sil
+    </button>
+  `;
+
+  itemsContainer.innerHTML = html;
+  positionAndShowContextMenu(e, menu);
+}
+
+function showEmptyAreaContextMenu(e) {
+  const menu = document.getElementById('contextMenu');
+  const itemsContainer = document.getElementById('contextMenuItems');
+  if (!menu || !itemsContainer) return;
+
+  itemsContainer.innerHTML = `
+    <button onclick="openModal('newFolderModal'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-folder-plus text-amber-400 w-4"></i> Yeni Klasör
+    </button>
+    <button onclick="openModal('newFileModal'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-file-circle-plus text-sky-400 w-4"></i> Yeni Dosya
+    </button>
+    <div class="my-1 border-t border-slate-800"></div>
+    <button onclick="refreshFiles(); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-arrows-rotate text-emerald-400 w-4"></i> Yenile
+    </button>
+    <button onclick="navigateUp(); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <i class="fa-solid fa-arrow-up text-slate-400 w-4"></i> Üst Dizine Çık
+    </button>
+  `;
+
+  positionAndShowContextMenu(e, menu);
+}
+
+function positionAndShowContextMenu(e, menu) {
+  menu.classList.remove('hidden');
+  const menuWidth = menu.offsetWidth || 192;
+  const menuHeight = menu.offsetHeight || 200;
+  const x = (e.clientX + menuWidth > window.innerWidth) ? (window.innerWidth - menuWidth - 10) : e.clientX;
+  const y = (e.clientY + menuHeight > window.innerHeight) ? (window.innerHeight - menuHeight - 10) : e.clientY;
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+}
+
+function hideContextMenu() {
+  const menu = document.getElementById('contextMenu');
+  if (menu) menu.classList.add('hidden');
 }
 
 // Sorting
