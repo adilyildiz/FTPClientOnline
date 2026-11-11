@@ -43,10 +43,55 @@ setInterval(() => {
 
 function addLog(session, type, message) {
   if (!session) return;
-  const timestamp = new Date().toLocaleTimeString();
-  session.logs.push({ timestamp, type, message });
+  const ts = Date.now();
+  const timestamp = new Date(ts).toLocaleTimeString('tr-TR');
+  session.logs.push({ ts, timestamp, type, message });
   if (session.logs.length > 200) {
     session.logs.shift();
+  }
+}
+
+function normalizePosixPath(p) {
+  if (!p) return '/';
+  let normalized = String(p).replace(/\\/g, '/');
+  if (!normalized.startsWith('/')) normalized = '/' + normalized;
+  normalized = path.posix.normalize(normalized);
+  if (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function sanitizeRelativePath(relPath) {
+  const parts = String(relPath || '').replace(/\\/g, '/').split('/');
+  const resolved = [];
+  for (const seg of parts) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      resolved.pop();
+    } else {
+      resolved.push(seg);
+    }
+  }
+  return resolved.join('/');
+}
+
+// Serialize FTP client commands per session to prevent concurrent basic-ftp task errors
+async function withSessionLock(sessionId, taskFn) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    throw new Error('Oturum bulunamadı veya süresi doldu. Lütfen yeniden bağlanın.');
+  }
+  const prev = session.lockPromise || Promise.resolve();
+  let release;
+  const next = new Promise(resolve => { release = resolve; });
+  session.lockPromise = prev.then(() => next, () => next);
+  await prev;
+  try {
+    const activeSession = await getFtpClient(sessionId);
+    return await taskFn(activeSession);
+  } finally {
+    release();
   }
 }
 
@@ -126,7 +171,8 @@ app.post('/api/connect', async (req, res) => {
     },
     currentDir: '/',
     lastActive: Date.now(),
-    logs: []
+    logs: [],
+    lockPromise: Promise.resolve()
   };
 
   try {
@@ -210,45 +256,132 @@ app.get('/api/list', async (req, res) => {
   const targetPath = req.query.path;
 
   try {
-    const session = await getFtpClient(sessionId);
-    const { client } = session;
+    const result = await withSessionLock(sessionId, async (session) => {
+      const { client } = session;
 
-    if (targetPath) {
-      await client.cd(targetPath);
-      session.currentDir = await client.pwd();
-    }
+      if (targetPath) {
+        await client.cd(targetPath);
+        session.currentDir = await client.pwd();
+      }
 
-    addLog(session, 'command', `LIST ${session.currentDir}`);
-    const list = await client.list();
-    addLog(session, 'info', `${list.length} adet dosya/dizin listelendi.`);
+      addLog(session, 'command', `LIST ${session.currentDir}`);
+      const list = await client.list();
+      addLog(session, 'info', `${list.length} adet dosya/dizin listelendi.`);
 
-    const formattedList = list.map(item => ({
-      name: item.name,
-      type: item.isDirectory ? 'directory' : item.isSymbolicLink ? 'symlink' : 'file',
-      size: item.size,
-      rawModifiedAt: item.rawModifiedAt,
-      modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : null,
-      permissions: item.permissions ? {
-        user: item.permissions.user,
-        group: item.permissions.group,
-        world: item.permissions.world
-      } : null,
-      isDirectory: item.isDirectory,
-      isSymbolicLink: item.isSymbolicLink
-    }));
+      const formattedList = list
+        .filter(item => item.name !== '.' && item.name !== '..')
+        .map(item => ({
+          name: item.name,
+          type: item.isDirectory ? 'directory' : item.isSymbolicLink ? 'symlink' : 'file',
+          size: item.size,
+          rawModifiedAt: item.rawModifiedAt,
+          modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : null,
+          permissions: item.permissions ? {
+            user: item.permissions.user,
+            group: item.permissions.group,
+            world: item.permissions.world
+          } : null,
+          isDirectory: item.isDirectory,
+          isSymbolicLink: item.isSymbolicLink
+        }));
 
-    // Sort: directories first, then alphabetical
-    formattedList.sort((a, b) => {
-      if (a.isDirectory && !b.isDirectory) return -1;
-      if (!a.isDirectory && b.isDirectory) return 1;
-      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      // Sort: directories first, then alphabetical
+      formattedList.sort((a, b) => {
+        if (a.isDirectory && !b.isDirectory) return -1;
+        if (!a.isDirectory && b.isDirectory) return 1;
+        return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+      });
+
+      return {
+        success: true,
+        currentDir: session.currentDir,
+        files: formattedList
+      };
     });
 
-    return res.json({
-      success: true,
-      currentDir: session.currentDir,
-      files: formattedList
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Recursively List Remote Directory Tree (for Folder Sync / Compare)
+app.post('/api/list-tree', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  const { basePath, maxDepth = 10, exclude = [] } = req.body || {};
+
+  const excludeSet = new Set(
+    Array.isArray(exclude)
+      ? exclude.map(s => String(s).trim()).filter(Boolean)
+      : []
+  );
+
+  try {
+    const result = await withSessionLock(sessionId, async (session) => {
+      const { client } = session;
+      const savedCwd = session.currentDir;
+      const rootPath = basePath ? normalizePosixPath(basePath) : normalizePosixPath(savedCwd);
+      const entries = [];
+      const MAX_ENTRIES = 5000;
+      let truncated = false;
+
+      async function walk(remoteDir, relPrefix, depth) {
+        if (entries.length >= MAX_ENTRIES) {
+          truncated = true;
+          return;
+        }
+        await client.cd(remoteDir);
+        const list = await client.list();
+
+        for (const item of list) {
+          if (item.name === '.' || item.name === '..') continue;
+          if (item.isSymbolicLink) continue;
+          if (excludeSet.has(item.name)) continue;
+
+          if (entries.length >= MAX_ENTRIES) {
+            truncated = true;
+            break;
+          }
+
+          const relPath = relPrefix ? `${relPrefix}/${item.name}` : item.name;
+          entries.push({
+            relativePath: relPath,
+            name: item.name,
+            type: item.isDirectory ? 'directory' : 'file',
+            size: item.size || 0,
+            rawModifiedAt: item.rawModifiedAt || null,
+            modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : null,
+            isDirectory: item.isDirectory
+          });
+
+          if (item.isDirectory && depth < maxDepth) {
+            const subDir = rootPath === '/' ? `/${relPath}` : `${rootPath}/${relPath}`;
+            await walk(subDir, relPath, depth + 1);
+          }
+        }
+      }
+
+      try {
+        addLog(session, 'command', `TREE ${rootPath} (senkronizasyon taraması)`);
+        await walk(rootPath, '', 0);
+        addLog(session, 'info', `${entries.length} uzak öğe tarandı${truncated ? ' (sınıra ulaşıldı)' : ''}.`);
+      } finally {
+        try {
+          await client.cd(savedCwd);
+        } catch (e) {
+          // ignore restore error
+        }
+      }
+
+      return {
+        success: true,
+        basePath: rootPath,
+        entries,
+        truncated
+      };
     });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -264,13 +397,15 @@ app.post('/api/cwd', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    addLog(session, 'command', `CWD ${newPath}`);
-    await session.client.cd(newPath);
-    session.currentDir = await session.client.pwd();
-    addLog(session, 'info', `Yeni dizin: ${session.currentDir}`);
+    const result = await withSessionLock(sessionId, async (session) => {
+      addLog(session, 'command', `CWD ${newPath}`);
+      await session.client.cd(newPath);
+      session.currentDir = await session.client.pwd();
+      addLog(session, 'info', `Yeni dizin: ${session.currentDir}`);
+      return { success: true, currentDir: session.currentDir };
+    });
 
-    return res.json({ success: true, currentDir: session.currentDir });
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -279,22 +414,67 @@ app.post('/api/cwd', async (req, res) => {
 // Create Directory (MKDIR)
 app.post('/api/mkdir', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  const { name } = req.body;
+  const { name, baseDir } = req.body;
 
   if (!name || name.trim() === '') {
     return res.status(400).json({ success: false, error: 'Klasör adı belirtilmedi.' });
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const safeName = name.trim();
-    addLog(session, 'command', `MKDIR ${safeName}`);
-    await session.client.ensureDir(safeName);
-    // return back to working dir if ensureDir changed it
-    await session.client.cd(session.currentDir);
-    addLog(session, 'success', `"${safeName}" klasörü oluşturuldu.`);
+    const result = await withSessionLock(sessionId, async (session) => {
+      const safeName = name.trim();
+      const targetDir = safeName.startsWith('/')
+        ? normalizePosixPath(safeName)
+        : (baseDir ? path.posix.join(normalizePosixPath(baseDir), sanitizeRelativePath(safeName)) : safeName);
 
-    return res.json({ success: true, message: 'Klasör başarıyla oluşturuldu.' });
+      addLog(session, 'command', `MKDIR ${targetDir}`);
+      await session.client.ensureDir(targetDir);
+      // return back to working dir if ensureDir changed it
+      await session.client.cd(session.currentDir);
+      addLog(session, 'success', `"${targetDir}" klasörü oluşturuldu.`);
+
+      return { success: true, message: 'Klasör başarıyla oluşturuldu.' };
+    });
+
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Batch Create Directories (for folder sync)
+app.post('/api/mkdir-batch', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  const { baseDir, paths } = req.body;
+
+  if (!paths || !Array.isArray(paths) || paths.length === 0) {
+    return res.status(400).json({ success: false, error: 'Oluşturulacak klasör listesi boş.' });
+  }
+
+  try {
+    const result = await withSessionLock(sessionId, async (session) => {
+      const rootDir = baseDir ? normalizePosixPath(baseDir) : session.currentDir;
+      let createdCount = 0;
+
+      try {
+        for (const relPath of paths) {
+          const safeRel = sanitizeRelativePath(relPath);
+          if (!safeRel) continue;
+          const fullDir = path.posix.join(rootDir, safeRel);
+          addLog(session, 'command', `MKDIR ${fullDir} (senkronizasyon)`);
+          await session.client.ensureDir(fullDir);
+          createdCount++;
+        }
+      } finally {
+        try {
+          await session.client.cd(session.currentDir);
+        } catch (e) {}
+      }
+
+      return { success: true, createdCount };
+    });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -310,12 +490,14 @@ app.post('/api/rename', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    addLog(session, 'command', `RNFR ${oldPath} -> RNTO ${newPath}`);
-    await session.client.rename(oldPath, newPath);
-    addLog(session, 'success', `Yeniden adlandırıldı: ${oldPath} -> ${newPath}`);
+    const result = await withSessionLock(sessionId, async (session) => {
+      addLog(session, 'command', `RNFR ${oldPath} -> RNTO ${newPath}`);
+      await session.client.rename(oldPath, newPath);
+      addLog(session, 'success', `Yeniden adlandırıldı: ${oldPath} -> ${newPath}`);
+      return { success: true, message: 'Başarıyla yeniden adlandırıldı.' };
+    });
 
-    return res.json({ success: true, message: 'Başarıyla yeniden adlandırıldı.' });
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -331,18 +513,20 @@ app.post('/api/delete', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    if (isDirectory) {
-      addLog(session, 'command', `RMD ${targetPath} (ve alt öğeleri)`);
-      await session.client.removeDir(targetPath);
-      addLog(session, 'success', `"${targetPath}" dizini silindi.`);
-    } else {
-      addLog(session, 'command', `DELE ${targetPath}`);
-      await session.client.remove(targetPath);
-      addLog(session, 'success', `"${targetPath}" dosyası silindi.`);
-    }
+    const result = await withSessionLock(sessionId, async (session) => {
+      if (isDirectory) {
+        addLog(session, 'command', `RMD ${targetPath} (ve alt öğeleri)`);
+        await session.client.removeDir(targetPath);
+        addLog(session, 'success', `"${targetPath}" dizini silindi.`);
+      } else {
+        addLog(session, 'command', `DELE ${targetPath}`);
+        await session.client.remove(targetPath);
+        addLog(session, 'success', `"${targetPath}" dosyası silindi.`);
+      }
+      return { success: true, message: 'Öğe başarıyla silindi.' };
+    });
 
-    return res.json({ success: true, message: 'Öğe başarıyla silindi.' });
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -351,29 +535,43 @@ app.post('/api/delete', async (req, res) => {
 // Batch Delete Files and Directories
 app.post('/api/delete-batch', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  const { items } = req.body;
+  const { items, baseDir } = req.body;
 
   if (!items || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, error: 'Silinecek öğe seçilmedi.' });
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    let deletedCount = 0;
+    const result = await withSessionLock(sessionId, async (session) => {
+      let deletedCount = 0;
+      const rootDir = baseDir ? normalizePosixPath(baseDir) : null;
 
-    for (const item of items) {
-      if (item.isDirectory) {
-        addLog(session, 'command', `RMD ${item.path} (toplu silme)`);
-        await session.client.removeDir(item.path);
-      } else {
-        addLog(session, 'command', `DELE ${item.path} (toplu silme)`);
-        await session.client.remove(item.path);
+      try {
+        for (const item of items) {
+          const target = rootDir
+            ? path.posix.join(rootDir, sanitizeRelativePath(item.path))
+            : item.path;
+
+          if (item.isDirectory) {
+            addLog(session, 'command', `RMD ${target} (toplu silme)`);
+            await session.client.removeDir(target);
+          } else {
+            addLog(session, 'command', `DELE ${target} (toplu silme)`);
+            await session.client.remove(target);
+          }
+          deletedCount++;
+        }
+      } finally {
+        try {
+          await session.client.cd(session.currentDir);
+        } catch (e) {}
       }
-      deletedCount++;
-    }
 
-    addLog(session, 'success', `Toplam ${deletedCount} öğe silindi.`);
-    return res.json({ success: true, message: `${deletedCount} öğe başarıyla silindi.` });
+      addLog(session, 'success', `Toplam ${deletedCount} öğe silindi.`);
+      return { success: true, message: `${deletedCount} öğe başarıyla silindi.` };
+    });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -389,34 +587,14 @@ app.get('/api/download-zip', async (req, res) => {
   let archive = null;
   let session = null;
 
-  try {
-    session = await getFtpClient(sessionId);
+  async function streamZip(clientForTransfer, activeSession) {
     const folderName = path.posix.basename(folderPath) || 'ftp-archive';
     const zipFilename = `${folderName}.zip`;
 
-    // Open a dedicated FTP connection so browsing doesn't collide; fall back to session client if limited
-    const tempClient = new ftp.Client(30000);
-    tempClient.ftp.verbose = false;
-    try {
-      await tempClient.access({
-        host: session.config.host,
-        port: session.config.port || 21,
-        user: session.config.user || 'anonymous',
-        password: session.config.password || '',
-        secure: session.config.secure || false,
-        secureOptions: { rejectUnauthorized: false }
-      });
-      transferClient = tempClient;
-      usingTempClient = true;
-    } catch (connErr) {
-      try { tempClient.close(); } catch (e) {}
-      transferClient = session.client;
-    }
-
     // Verify target folder exists and is readable before sending response headers
-    await transferClient.cd(folderPath);
+    await clientForTransfer.cd(folderPath);
 
-    addLog(session, 'command', `ZIP ${folderPath} (arşiv oluşturuluyor...)`);
+    addLog(activeSession, 'command', `ZIP ${folderPath} (arşiv oluşturuluyor...)`);
 
     archive = new ZipArchive({ zlib: { level: 6 } });
     archive.on('error', err => {
@@ -433,8 +611,8 @@ app.get('/api/download-zip', async (req, res) => {
     archive.pipe(res);
 
     async function addFolderToZip(remoteDir, zipPrefix = '') {
-      await transferClient.cd(remoteDir);
-      const list = await transferClient.list();
+      await clientForTransfer.cd(remoteDir);
+      const list = await clientForTransfer.list();
 
       // Append files inside remoteDir first
       for (const item of list) {
@@ -448,7 +626,7 @@ app.get('/api/download-zip', async (req, res) => {
               callback();
             }
           });
-          await transferClient.downloadTo(writable, item.name);
+          await clientForTransfer.downloadTo(writable, item.name);
           archive.append(Buffer.concat(chunks), { name: itemZipPath });
         }
       }
@@ -468,7 +646,47 @@ app.get('/api/download-zip', async (req, res) => {
     await addFolderToZip(folderPath);
     await archive.finalize();
 
-    addLog(session, 'success', `"${zipFilename}" ZIP arşivi indirildi.`);
+    addLog(activeSession, 'success', `"${zipFilename}" ZIP arşivi indirildi.`);
+  }
+
+  try {
+    session = sessions.get(sessionId);
+    if (!session) {
+      throw new Error('Oturum bulunamadı veya süresi doldu. Lütfen yeniden bağlanın.');
+    }
+    session.lastActive = Date.now();
+
+    // Open a dedicated FTP connection so browsing doesn't collide; fall back to locked session client if limited
+    const tempClient = new ftp.Client(30000);
+    tempClient.ftp.verbose = false;
+    try {
+      await tempClient.access({
+        host: session.config.host,
+        port: session.config.port || 21,
+        user: session.config.user || 'anonymous',
+        password: session.config.password || '',
+        secure: session.config.secure || false,
+        secureOptions: { rejectUnauthorized: false }
+      });
+      transferClient = tempClient;
+      usingTempClient = true;
+    } catch (connErr) {
+      try { tempClient.close(); } catch (e) {}
+    }
+
+    if (usingTempClient) {
+      await streamZip(transferClient, session);
+    } else {
+      await withSessionLock(sessionId, async (lockedSession) => {
+        try {
+          await streamZip(lockedSession.client, lockedSession);
+        } finally {
+          if (!lockedSession.client.closed) {
+            try { await lockedSession.client.cd(lockedSession.currentDir); } catch (e) {}
+          }
+        }
+      });
+    }
   } catch (err) {
     console.error('Download ZIP error:', err);
     if (session) {
@@ -487,8 +705,6 @@ app.get('/api/download-zip', async (req, res) => {
   } finally {
     if (usingTempClient && transferClient) {
       try { transferClient.close(); } catch (e) {}
-    } else if (session && session.client && !session.client.closed) {
-      try { await session.client.cd(session.currentDir); } catch (e) {}
     }
   }
 });
@@ -503,21 +719,22 @@ app.get('/api/download', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const filename = path.basename(filePath);
-    const contentType = mime.lookup(filename) || 'application/octet-stream';
+    await withSessionLock(sessionId, async (session) => {
+      const filename = path.basename(filePath);
+      const contentType = mime.lookup(filename) || 'application/octet-stream';
 
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+      res.setHeader('Content-Type', contentType);
 
-    addLog(session, 'command', `RETR ${filePath} (indirme)`);
+      addLog(session, 'command', `RETR ${filePath} (indirme)`);
 
-    // Download stream from FTP client directly to HTTP response
-    const passThrough = new stream.PassThrough();
-    passThrough.pipe(res);
+      // Download stream from FTP client directly to HTTP response
+      const passThrough = new stream.PassThrough();
+      passThrough.pipe(res);
 
-    await session.client.downloadTo(passThrough, filePath);
-    addLog(session, 'success', `"${filename}" indirmesi tamamlandı.`);
+      await session.client.downloadTo(passThrough, filePath);
+      addLog(session, 'success', `"${filename}" indirmesi tamamlandı.`);
+    });
   } catch (err) {
     if (!res.headersSent) {
       return res.status(500).json({ success: false, error: err.message });
@@ -536,36 +753,39 @@ app.get('/api/view', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const filename = path.basename(filePath);
-    const contentType = mime.lookup(filename) || 'text/plain';
+    const result = await withSessionLock(sessionId, async (session) => {
+      const filename = path.basename(filePath);
+      const contentType = mime.lookup(filename) || 'text/plain';
 
-    // Buffer download (max 15MB for in-memory view/edit)
-    const chunks = [];
-    const writable = new stream.Writable({
-      write(chunk, encoding, callback) {
-        chunks.push(chunk);
-        callback();
-      }
+      // Buffer download (max 15MB for in-memory view/edit)
+      const chunks = [];
+      const writable = new stream.Writable({
+        write(chunk, encoding, callback) {
+          chunks.push(chunk);
+          callback();
+        }
+      });
+
+      addLog(session, 'command', `RETR ${filePath} (önizleme)`);
+      await session.client.downloadTo(writable, filePath);
+      const buffer = Buffer.concat(chunks);
+
+      return { filename, contentType, buffer };
     });
 
-    addLog(session, 'command', `RETR ${filePath} (önizleme)`);
-    await session.client.downloadTo(writable, filePath);
-    const buffer = Buffer.concat(chunks);
-
     if (isInline) {
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
-      return res.send(buffer);
+      res.setHeader('Content-Type', result.contentType);
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(result.filename)}"`);
+      return res.send(result.buffer);
     }
 
     // Return as text for code editor
-    const textContent = buffer.toString('utf8');
+    const textContent = result.buffer.toString('utf8');
     return res.json({
       success: true,
-      filename,
-      contentType,
-      size: buffer.length,
+      filename: result.filename,
+      contentType: result.contentType,
+      size: result.buffer.length,
       content: textContent
     });
   } catch (err) {
@@ -583,15 +803,18 @@ app.post('/api/save', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const buffer = Buffer.from(content, 'utf8');
-    const readStream = stream.Readable.from(buffer);
+    const result = await withSessionLock(sessionId, async (session) => {
+      const buffer = Buffer.from(content, 'utf8');
+      const readStream = stream.Readable.from(buffer);
 
-    addLog(session, 'command', `STOR ${filePath} (kaydetme)`);
-    await session.client.uploadFrom(readStream, filePath);
-    addLog(session, 'success', `"${filePath}" başarıyla kaydedildi (${buffer.length} bayt).`);
+      addLog(session, 'command', `STOR ${filePath} (kaydetme)`);
+      await session.client.uploadFrom(readStream, filePath);
+      addLog(session, 'success', `"${filePath}" başarıyla kaydedildi (${buffer.length} bayt).`);
 
-    return res.json({ success: true, message: 'Dosya başarıyla kaydedildi.' });
+      return { success: true, message: 'Dosya başarıyla kaydedildi.' };
+    });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -600,61 +823,66 @@ app.post('/api/save', async (req, res) => {
 // Check if target files already exist (FileZilla-style overwrite detection)
 app.post('/api/check-exists', async (req, res) => {
   const sessionId = req.headers['x-session-id'];
-  const { paths } = req.body;
+  const { paths, baseDir } = req.body;
 
   if (!paths || !Array.isArray(paths)) {
     return res.status(400).json({ success: false, error: 'Dosya listesi (paths) gereklidir.' });
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const conflicts = [];
+    const result = await withSessionLock(sessionId, async (session) => {
+      const rootDir = baseDir ? normalizePosixPath(baseDir) : session.currentDir;
+      const conflicts = [];
 
-    // Group files by parent directory to optimize FTP LIST calls
-    const dirsToCheck = new Map();
+      // Group files by parent directory to optimize FTP LIST calls
+      const dirsToCheck = new Map();
 
-    for (const relPath of paths) {
-      const normalized = relPath.replace(/\\/g, '/');
-      const dir = path.posix.dirname(normalized);
-      const filename = path.posix.basename(normalized);
-      const fullDir = (dir && dir !== '.' && dir !== '/')
-        ? path.posix.join(session.currentDir, dir)
-        : session.currentDir;
+      for (const relPath of paths) {
+        const normalized = sanitizeRelativePath(relPath);
+        if (!normalized) continue;
+        const dir = path.posix.dirname(normalized);
+        const filename = path.posix.basename(normalized);
+        const fullDir = (dir && dir !== '.' && dir !== '/')
+          ? path.posix.join(rootDir, dir)
+          : rootDir;
 
-      if (!dirsToCheck.has(fullDir)) {
-        dirsToCheck.set(fullDir, []);
-      }
-      dirsToCheck.get(fullDir).push({ relPath: normalized, filename });
-    }
-
-    for (const [fullDir, files] of dirsToCheck.entries()) {
-      try {
-        const list = await session.client.list(fullDir);
-        const map = new Map();
-        list.forEach(item => map.set(item.name, item));
-
-        for (const { relPath, filename } of files) {
-          if (map.has(filename)) {
-            const item = map.get(filename);
-            conflicts.push({
-              relativePath: relPath,
-              filename,
-              exists: true,
-              size: item.size,
-              modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : (item.rawModifiedAt || null),
-              isDirectory: item.isDirectory
-            });
-          }
+        if (!dirsToCheck.has(fullDir)) {
+          dirsToCheck.set(fullDir, []);
         }
-      } catch (dirErr) {
-        // If directory doesn't exist on FTP yet, no files exist in it
+        dirsToCheck.get(fullDir).push({ relPath: normalized, filename });
       }
-    }
 
-    // Ensure we are back in working dir
-    await session.client.cd(session.currentDir);
+      for (const [fullDir, files] of dirsToCheck.entries()) {
+        try {
+          const list = await session.client.list(fullDir);
+          const map = new Map();
+          list.forEach(item => map.set(item.name, item));
 
-    return res.json({ success: true, conflicts });
+          for (const { relPath, filename } of files) {
+            if (map.has(filename)) {
+              const item = map.get(filename);
+              conflicts.push({
+                relativePath: relPath,
+                filename,
+                exists: true,
+                size: item.size,
+                modifiedAt: item.modifiedAt ? item.modifiedAt.toISOString() : (item.rawModifiedAt || null),
+                isDirectory: item.isDirectory
+              });
+            }
+          }
+        } catch (dirErr) {
+          // If directory doesn't exist on FTP yet, no files exist in it
+        }
+      }
+
+      // Ensure we are back in working dir
+      await session.client.cd(session.currentDir);
+
+      return { success: true, conflicts };
+    });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -669,50 +897,58 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    const uploadedFiles = [];
+    const result = await withSessionLock(sessionId, async (session) => {
+      const rootDir = req.body.baseDir ? normalizePosixPath(req.body.baseDir) : session.currentDir;
+      const uploadedFiles = [];
 
-    // Parse relative paths if provided (for folders & nested structures)
-    let relativePaths = [];
-    if (req.body.paths) {
+      // Parse relative paths if provided (for folders & nested structures)
+      let relativePaths = [];
+      if (req.body.paths) {
+        try {
+          relativePaths = typeof req.body.paths === 'string' ? JSON.parse(req.body.paths) : req.body.paths;
+        } catch (e) {
+          relativePaths = [req.body.paths];
+        }
+      }
+
       try {
-        relativePaths = typeof req.body.paths === 'string' ? JSON.parse(req.body.paths) : req.body.paths;
-      } catch (e) {
-        relativePaths = [req.body.paths];
+        for (let i = 0; i < req.files.length; i++) {
+          const file = req.files[i];
+          const relPath = (relativePaths && relativePaths[i]) ? relativePaths[i] : file.originalname;
+          const readStream = stream.Readable.from(file.buffer);
+
+          // Handle nested folder directories
+          const normalizedRelPath = sanitizeRelativePath(relPath) || file.originalname;
+          const dirName = path.posix.dirname(normalizedRelPath);
+
+          if (dirName && dirName !== '.' && dirName !== '/') {
+            const fullDir = path.posix.join(rootDir, dirName);
+            addLog(session, 'command', `MKDIR ${fullDir} (klasör yapısı)`);
+            await session.client.ensureDir(fullDir);
+            await session.client.cd(session.currentDir);
+          }
+
+          const targetPath = path.posix.join(rootDir, normalizedRelPath);
+          addLog(session, 'command', `STOR ${targetPath} (${file.size} bayt)`);
+          await session.client.uploadFrom(readStream, targetPath);
+          addLog(session, 'success', `"${normalizedRelPath}" yüklendi.`);
+          uploadedFiles.push(normalizedRelPath);
+        }
+      } finally {
+        // Ensure we are back in currentDir
+        try {
+          await session.client.cd(session.currentDir);
+        } catch (e) {}
       }
-    }
 
-    for (let i = 0; i < req.files.length; i++) {
-      const file = req.files[i];
-      const relPath = (relativePaths && relativePaths[i]) ? relativePaths[i] : file.originalname;
-      const readStream = stream.Readable.from(file.buffer);
-
-      // Handle nested folder directories
-      const normalizedRelPath = relPath.replace(/\\/g, '/');
-      const dirName = path.posix.dirname(normalizedRelPath);
-
-      if (dirName && dirName !== '.' && dirName !== '/') {
-        const fullDir = path.posix.join(session.currentDir, dirName);
-        addLog(session, 'command', `MKDIR ${fullDir} (klasör yapısı)`);
-        await session.client.ensureDir(fullDir);
-        await session.client.cd(session.currentDir);
-      }
-
-      const targetPath = path.posix.join(session.currentDir, normalizedRelPath);
-      addLog(session, 'command', `STOR ${targetPath} (${file.size} bayt)`);
-      await session.client.uploadFrom(readStream, targetPath);
-      addLog(session, 'success', `"${normalizedRelPath}" yüklendi.`);
-      uploadedFiles.push(normalizedRelPath);
-    }
-
-    // Ensure we are back in currentDir
-    await session.client.cd(session.currentDir);
-
-    return res.json({
-      success: true,
-      message: `${uploadedFiles.length} dosya başarıyla yüklendi.`,
-      files: uploadedFiles
+      return {
+        success: true,
+        message: `${uploadedFiles.length} dosya başarıyla yüklendi.`,
+        files: uploadedFiles
+      };
     });
+
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -728,12 +964,14 @@ app.post('/api/chmod', async (req, res) => {
   }
 
   try {
-    const session = await getFtpClient(sessionId);
-    addLog(session, 'command', `SITE CHMOD ${mode} ${targetPath}`);
-    await session.client.send(`SITE CHMOD ${mode} ${targetPath}`);
-    addLog(session, 'success', `İzinler güncellendi: ${mode} (${targetPath})`);
+    const result = await withSessionLock(sessionId, async (session) => {
+      addLog(session, 'command', `SITE CHMOD ${mode} ${targetPath}`);
+      await session.client.send(`SITE CHMOD ${mode} ${targetPath}`);
+      addLog(session, 'success', `İzinler güncellendi: ${mode} (${targetPath})`);
+      return { success: true, message: 'İzinler başarıyla güncellendi.' };
+    });
 
-    return res.json({ success: true, message: 'İzinler başarıyla güncellendi.' });
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ success: false, error: `İzin değiştirilemedi: ${err.message}` });
   }

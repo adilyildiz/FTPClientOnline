@@ -3,11 +3,33 @@
 let currentSession = null;
 let currentPath = '/';
 let fileList = [];
+window.fileList = fileList;
 let sortField = 'name';
 let sortDirection = 'asc';
 let logPollInterval = null;
 let currentEditingPath = null;
+window.currentEditingSource = 'remote';
+window.currentLocalEditingHandle = null;
 let selectedNames = new Set();
+let pendingDefaultRemoteDir = null;
+let clientLogs = [];
+let logsClearedAtTs = 0;
+
+function addClientLog(type, message) {
+  const ts = Date.now();
+  clientLogs.push({
+    ts,
+    timestamp: new Date(ts).toLocaleTimeString('tr-TR'),
+    type,
+    message
+  });
+  if (clientLogs.length > 200) clientLogs.shift();
+  if (!currentSession) {
+    renderLogs([]);
+  } else {
+    fetchLogs();
+  }
+}
 
 // Initialize on DOM load
 document.addEventListener('DOMContentLoaded', () => {
@@ -51,10 +73,37 @@ function setupEventListeners() {
   // Bookmarks modal button
   document.getElementById('openBookmarksBtn').addEventListener('click', () => openModal('bookmarksModal'));
 
+  // Window Drag & Drop for FileZilla XML files
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+      e.preventDefault();
+    }
+  });
+  window.addEventListener('drop', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+    const file = e.dataTransfer.files[0];
+    if (file && (file.name.toLowerCase().endsWith('.xml') || file.type === 'text/xml' || file.type === 'application/xml')) {
+      e.preventDefault();
+      e.stopPropagation();
+      readAndProcessFileZillaXmlFile(file);
+    }
+  });
+
   // Context Menu dismiss handlers
   document.addEventListener('click', () => hideContextMenu());
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') hideContextMenu();
+  });
+
+  // Enter key shortcuts inside quick modals
+  document.getElementById('newFolderNameInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitNewFolder(); }
+  });
+  document.getElementById('newFileNameInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitNewFile(); }
+  });
+  document.getElementById('renameNewNameInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitRename(); }
   });
 
   // Right-click on empty explorer table container
@@ -90,6 +139,8 @@ async function checkExistingSession() {
       updateConnectionUI(true);
       await loadDirectory(currentPath);
       startLogPolling();
+      if (typeof updateSyncToolbarState === 'function') updateSyncToolbarState();
+      if (typeof checkAndOfferSavedMapping === 'function') await checkAndOfferSavedMapping(currentSession);
       showToast(`Aktif oturum geri yüklendi: ${data.user}@${data.host}`, 'info');
     } else {
       sessionStorage.removeItem('cloudftp_sessionId');
@@ -133,8 +184,26 @@ async function handleConnect(e) {
     currentPath = data.currentDir || '/';
 
     updateConnectionUI(true);
-    await loadDirectory(currentPath);
+    if (pendingDefaultRemoteDir) {
+      const targetStartDir = pendingDefaultRemoteDir;
+      pendingDefaultRemoteDir = null;
+      try {
+        await loadDirectory(targetStartDir);
+      } catch (_) {
+        await loadDirectory(currentPath);
+      }
+    } else {
+      await loadDirectory(currentPath);
+    }
     startLogPolling();
+    if (typeof updateSyncToolbarState === 'function') updateSyncToolbarState();
+    let appliedFromBookmark = false;
+    if (typeof applyPendingBookmarkMappingOnConnect === 'function') {
+      appliedFromBookmark = await applyPendingBookmarkMappingOnConnect();
+    }
+    if (!appliedFromBookmark && typeof checkAndOfferSavedMapping === 'function') {
+      await checkAndOfferSavedMapping(currentSession);
+    }
     showToast(`Bağlandı: ${data.user}@${data.host}`, 'success');
   } catch (err) {
     updateStatus('disconnected', 'Bağlantı Hatası');
@@ -163,7 +232,16 @@ async function handleDisconnect() {
   stopLogPolling();
   updateConnectionUI(false);
   fileList = [];
+  window.fileList = fileList;
   renderFileList();
+  if (typeof syncState !== 'undefined') {
+    syncState.isSyncNavigating = false;
+    syncState.syncBrowsing = false;
+  }
+  if (typeof hideSavedMappingBanner === 'function') hideSavedMappingBanner();
+  if (typeof hideSyncWarning === 'function') hideSyncWarning();
+  if (typeof updateSyncToolbarState === 'function') updateSyncToolbarState();
+  if (typeof refreshComparisonAndRender === 'function') refreshComparisonAndRender();
   showToast('Bağlantı kapatıldı.', 'info');
 }
 
@@ -232,7 +310,7 @@ function updateStatus(state, message) {
 }
 
 // Load Directory Content
-async function loadDirectory(path) {
+async function loadDirectory(path, options = { triggerSync: false }) {
   if (!currentSession) return;
 
   const refreshIcon = document.getElementById('refreshIcon');
@@ -251,10 +329,19 @@ async function loadDirectory(path) {
 
     currentPath = data.currentDir;
     fileList = data.files || [];
+    window.fileList = fileList;
     clearSelection();
 
     renderBreadcrumb(currentPath);
-    renderFileList();
+    if (typeof computeComparison === 'function') computeComparison();
+    renderFileList(document.getElementById('searchInput')?.value.trim() || '');
+    if (typeof renderLocalFileList === 'function') {
+      renderLocalFileList(document.getElementById('localSearchInput')?.value.trim() || '');
+    }
+
+    if (options.triggerSync && typeof onRemoteNavigatedForSync === 'function') {
+      await onRemoteNavigatedForSync(currentPath);
+    }
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -264,7 +351,7 @@ async function loadDirectory(path) {
 
 // Refresh Directory
 async function refreshFiles() {
-  await loadDirectory(currentPath);
+  await loadDirectory(currentPath, { triggerSync: false });
 }
 
 // Change Directory
@@ -287,7 +374,7 @@ async function changeDirectory(targetPath) {
     }
 
     currentPath = data.currentDir;
-    await loadDirectory(currentPath);
+    await loadDirectory(currentPath, { triggerSync: true });
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -301,10 +388,13 @@ function navigateUp() {
 // Render Breadcrumbs
 function renderBreadcrumb(path) {
   const bar = document.getElementById('breadcrumbBar');
+  const mappedRoot = (typeof syncState !== 'undefined' && syncState.mapped) ? syncState.remoteBasePath : null;
+  const isRootMapped = mappedRoot === '/';
+
   if (!path || path === '/') {
     bar.innerHTML = `
       <button onclick="changeDirectory('/')" class="text-sky-400 hover:text-sky-300 font-bold flex items-center gap-1">
-        <i class="fa-solid fa-house text-xs"></i> / (root)
+        <i class="fa-solid fa-house text-xs"></i> / (root)${isRootMapped ? ' <i class="fa-solid fa-anchor text-amber-400 text-[9px] ml-0.5" title="Eşleme Kökü"></i>' : ''}
       </button>`;
     return;
   }
@@ -313,33 +403,188 @@ function renderBreadcrumb(path) {
   let accumulated = '';
   let html = `
     <button onclick="changeDirectory('/')" class="text-sky-400 hover:text-sky-300 font-bold flex items-center gap-1">
-      <i class="fa-solid fa-house text-xs"></i> /
+      <i class="fa-solid fa-house text-xs"></i> /${isRootMapped ? ' <i class="fa-solid fa-anchor text-amber-400 text-[9px]" title="Eşleme Kökü"></i>' : ''}
     </button>`;
 
   parts.forEach((part, idx) => {
     accumulated += '/' + part;
     const isLast = idx === parts.length - 1;
     const clickPath = accumulated;
+    const isMapped = mappedRoot === clickPath;
 
     html += `<span class="text-slate-600">/</span>`;
     if (isLast) {
-      html += `<span class="text-slate-100 font-bold px-1 py-0.5 rounded bg-slate-800">${escapeHtml(part)}</span>`;
+      html += `<span class="text-slate-100 font-bold px-1 py-0.5 rounded bg-slate-800">${escapeHtml(part)}${isMapped ? ' <i class="fa-solid fa-anchor text-amber-400 text-[9px] ml-0.5" title="Eşleme Kökü"></i>' : ''}</span>`;
     } else {
-      html += `<button onclick="changeDirectory('${escapeHtml(clickPath)}')" class="text-slate-300 hover:text-sky-400 hover:underline px-1">${escapeHtml(part)}</button>`;
+      html += `<button onclick="changeDirectory('${escapeAttrArg(clickPath)}')" class="text-slate-300 hover:text-sky-400 hover:underline px-1">${escapeHtml(part)}${isMapped ? ' <i class="fa-solid fa-anchor text-amber-400 text-[9px]" title="Eşleme Kökü"></i>' : ''}</button>`;
     }
   });
 
   bar.innerHTML = html;
 }
 
+function renderRemotePlaceholderRow(tbody, name = '') {
+  const tr = document.createElement('tr');
+  tr.className = 'h-9 border-b border-slate-800/25 bg-slate-950/20 comparison-placeholder pointer-events-none select-none';
+  tr.setAttribute('data-placeholder', 'true');
+  tr.innerHTML = `
+    <td class="h-9 py-0 pl-3 pr-1 w-7 text-center">&nbsp;</td>
+    <td class="h-9 py-0 px-2 text-slate-600/40 text-[11px] font-mono italic">&nbsp;</td>
+    <td class="h-9 py-0 px-2 w-20 text-right text-slate-600/40 text-[11px] font-mono">&nbsp;</td>
+    <td class="h-9 py-0 px-2 w-24 hidden 2xl:table-cell text-center">&nbsp;</td>
+    <td class="h-9 py-0 px-2 w-32 hidden xl:table-cell text-slate-600/40 text-[11px]">&nbsp;</td>
+    <td class="h-9 py-0 px-2 w-36 text-right">&nbsp;</td>
+  `;
+  tbody.appendChild(tr);
+}
+
+function renderRemoteRow(tbody, file, localWritable) {
+  const tr = document.createElement('tr');
+  const isSelected = selectedNames.has(file.name);
+  const cmp = typeof getRemoteComparisonInfo === 'function' ? getRemoteComparisonInfo(file.name) : null;
+  const cmpRowClass = cmp ? cmp.rowClass : '';
+
+  tr.className = `${isSelected ? 'bg-sky-950/40' : (cmpRowClass || 'hover:bg-slate-800/40')} h-9 border-b border-slate-800/40 transition group`;
+
+  const iconHtml = getFileIcon(file);
+  const sizeStr = file.isDirectory ? '-' : formatBytes(file.size);
+  const dateStr = file.modifiedAt
+    ? new Date(file.modifiedAt).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : (file.rawModifiedAt || '-');
+  const permBadge = formatPermissions(file.permissions);
+  const cmpBadge = cmp && cmp.badgeHtml ? cmp.badgeHtml : '';
+  const safeName = escapeHtml(file.name);
+  const safeArg = escapeAttrArg(file.name);
+
+  tr.innerHTML = `
+    <td class="pl-3 pr-1 align-middle text-center">
+      <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRowSelection('${safeArg}', this)"
+        class="row-checkbox rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer">
+    </td>
+    <td class="px-2 align-middle">
+      <div class="flex items-center gap-2 overflow-hidden min-w-0">
+        <span class="drag-source inline-flex items-center gap-2 min-w-0" draggable="true">
+          ${iconHtml}
+          <span class="remote-name-link truncate font-medium ${file.isDirectory ? 'text-sky-300 font-semibold cursor-pointer hover:underline' : 'text-slate-200 cursor-pointer hover:text-white'}"
+            title="${safeName}">
+            ${safeName}
+          </span>
+        </span>
+        ${cmpBadge}
+      </div>
+    </td>
+    <td class="px-2 align-middle text-right text-slate-400 font-mono text-[11px] whitespace-nowrap">${sizeStr}</td>
+    <td class="px-2 align-middle text-center hidden 2xl:table-cell whitespace-nowrap">
+      <span class="inline-block px-1.5 py-1 rounded text-[10px] leading-none whitespace-nowrap bg-slate-800/80 text-slate-300 border border-slate-700/60 font-mono">${permBadge}</span>
+    </td>
+    <td class="px-2 align-middle text-slate-400 text-[11px] whitespace-nowrap hidden xl:table-cell">${dateStr}</td>
+    <td class="px-2 align-middle text-right whitespace-nowrap">
+      <div class="inline-flex items-center gap-0.5 opacity-80 group-hover:opacity-100 transition">
+        ${localWritable ? `
+          <button onclick="downloadRemoteItemToLocal('${safeArg}', ${file.isDirectory})" title="Eşleşen Yerel Klasöre İndir" class="w-6 h-6 rounded hover:bg-slate-700 text-emerald-400 hover:text-emerald-300 flex items-center justify-center transition">
+            <i class="fa-solid fa-arrow-left text-[11px]"></i>
+          </button>
+        ` : ''}
+        ${file.isDirectory ? `
+          <button onclick="downloadFolderAsZip('${safeArg}')" title="ZIP Olarak İndir" class="w-6 h-6 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
+            <i class="fa-solid fa-file-zipper text-[11px]"></i>
+          </button>
+        ` : `
+          <button onclick="downloadFile('${safeArg}')" title="İndir" class="w-6 h-6 rounded hover:bg-slate-700 text-slate-300 hover:text-emerald-400 flex items-center justify-center transition">
+            <i class="fa-solid fa-download text-[11px]"></i>
+          </button>
+          <button onclick="openFilePreview('${safeArg}')" title="Görüntüle / Düzenle" class="w-6 h-6 rounded hover:bg-slate-700 text-slate-300 hover:text-sky-400 flex items-center justify-center transition">
+            <i class="fa-solid fa-pen-to-square text-[11px]"></i>
+          </button>
+        `}
+        <button onclick="openRenameModal('${safeArg}')" title="Yeniden Adlandır" class="w-6 h-6 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
+          <i class="fa-solid fa-pen text-[11px]"></i>
+        </button>
+        <button onclick="openChmodModal('${safeArg}')" title="İzinler (CHMOD)" class="w-6 h-6 rounded hover:bg-slate-700 text-slate-300 hover:text-purple-400 flex items-center justify-center transition">
+          <i class="fa-solid fa-key text-[11px]"></i>
+        </button>
+        <button onclick="deleteItem('${safeArg}', ${file.isDirectory})" title="Sil" class="w-6 h-6 rounded hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 flex items-center justify-center transition">
+          <i class="fa-solid fa-trash-can text-[11px]"></i>
+        </button>
+      </div>
+    </td>
+  `;
+
+  // Drag only from icon/name handle (allows marquee box selection on empty row/cell areas)
+  tr.querySelector('.drag-source')?.addEventListener('dragstart', (e) => {
+    const names = (selectedNames.has(file.name) && selectedNames.size > 1)
+      ? Array.from(selectedNames)
+      : [file.name];
+    e.dataTransfer.setData('application/x-cloudftp-remote', JSON.stringify({
+      multiple: names.length > 1,
+      names,
+      name: file.name,
+      isDirectory: file.isDirectory
+    }));
+    e.dataTransfer.effectAllowed = 'copy';
+  });
+
+  // Row click: click on row text to enter folder or view file
+  tr.querySelector('.remote-name-link')?.addEventListener('click', () => {
+    if (file.isDirectory) {
+      changeDirectory(file.name);
+    } else {
+      openFilePreview(file.name);
+    }
+  });
+
+  // Right-click context menu on row
+  tr.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showContextMenu(e, file);
+  });
+
+  tbody.appendChild(tr);
+}
+
 // Render File Table
 function renderFileList(filterQuery = '') {
   const tbody = document.getElementById('fileListBody');
+  if (!tbody) return;
   tbody.innerHTML = '';
+
+  const isComparing = typeof syncState !== 'undefined' && syncState.compareEnabled && typeof localState !== 'undefined' && localState.provider && currentSession;
+  if (isComparing && typeof getAlignedComparisonSlots === 'function') {
+    const localQuery = document.getElementById('localSearchInput')?.value.trim() || '';
+    const aligned = getAlignedComparisonSlots(localQuery, filterQuery);
+    if (!aligned || aligned.slots.length === 0) {
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="6" class="py-8 text-center text-slate-500 font-sans">
+            <i class="fa-regular fa-folder-open text-2xl mb-2 block text-slate-600"></i>
+            ${syncState.compareDiffOnly ? 'Bu dizinde fark bulunamadı.' : 'Bu klasörde görüntülenecek dosya yok.'}
+          </td>
+        </tr>`;
+      if (typeof syncComparisonRerender === 'function') syncComparisonRerender('remote');
+      return;
+    }
+
+    const localWritable = typeof canWriteToLocal === 'function' && canWriteToLocal();
+    aligned.slots.forEach(slot => {
+      const file = slot.type === 'dir' ? aligned.remoteDirMap.get(slot.name) : aligned.remoteFileMap.get(slot.name);
+      if (file) {
+        renderRemoteRow(tbody, file, localWritable);
+      } else {
+        renderRemotePlaceholderRow(tbody, slot.name);
+      }
+    });
+
+    if (typeof syncComparisonRerender === 'function') syncComparisonRerender('remote');
+    return;
+  }
 
   let filtered = [...fileList];
   if (filterQuery) {
     filtered = filtered.filter(f => f.name.toLowerCase().includes(filterQuery.toLowerCase()));
+  }
+
+  if (typeof shouldHideRemoteInDiffOnly === 'function') {
+    filtered = filtered.filter(f => !shouldHideRemoteInDiffOnly(f.name));
   }
 
   // Sort
@@ -371,83 +616,15 @@ function renderFileList(filterQuery = '') {
       <tr>
         <td colspan="6" class="py-8 text-center text-slate-500 font-sans">
           <i class="fa-regular fa-folder-open text-2xl mb-2 block text-slate-600"></i>
-          Bu klasörde görüntülenecek dosya yok.
+          ${typeof syncState !== 'undefined' && syncState.compareEnabled && syncState.compareDiffOnly ? 'Bu dizinde fark bulunamadı.' : 'Bu klasörde görüntülenecek dosya yok.'}
         </td>
       </tr>`;
     return;
   }
 
+  const localWritable = typeof canWriteToLocal === 'function' && canWriteToLocal();
   filtered.forEach(file => {
-    const tr = document.createElement('tr');
-    const isSelected = selectedNames.has(file.name);
-    tr.className = `${isSelected ? 'bg-sky-950/40' : 'hover:bg-slate-800/40'} border-b border-slate-800/40 transition group`;
-
-    const iconHtml = getFileIcon(file);
-    const sizeStr = file.isDirectory ? '-' : formatBytes(file.size);
-    const dateStr = file.modifiedAt ? new Date(file.modifiedAt).toLocaleString('tr-TR') : (file.rawModifiedAt || '-');
-    const permBadge = formatPermissions(file.permissions);
-
-    tr.innerHTML = `
-      <td class="py-2.5 pl-4 pr-1 text-center">
-        <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRowSelection('${escapeHtml(file.name)}', this)"
-          class="row-checkbox rounded bg-slate-800 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer">
-      </td>
-      <td class="py-2.5 px-3 flex items-center gap-2.5 overflow-hidden">
-        ${iconHtml}
-        <span class="truncate font-medium ${file.isDirectory ? 'text-sky-300 font-semibold cursor-pointer hover:underline' : 'text-slate-200 cursor-pointer hover:text-white'}"
-          title="${escapeHtml(file.name)}">
-          ${escapeHtml(file.name)}
-        </span>
-      </td>
-      <td class="py-2.5 px-4 text-right text-slate-400 font-mono text-[11px]">${sizeStr}</td>
-      <td class="py-2.5 px-4 text-center">
-        <span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-800/80 text-slate-300 border border-slate-700/60 font-mono">${permBadge}</span>
-      </td>
-      <td class="py-2.5 px-4 text-slate-400 text-[11px] whitespace-nowrap">${dateStr}</td>
-      <td class="py-2.5 px-4 text-right whitespace-nowrap">
-        <div class="inline-flex items-center gap-1 opacity-80 group-hover:opacity-100 transition">
-          ${file.isDirectory ? `
-            <button onclick="downloadFolderAsZip('${escapeHtml(file.name)}')" title="ZIP Olarak İndir" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
-              <i class="fa-solid fa-file-zipper text-xs"></i>
-            </button>
-          ` : `
-            <button onclick="downloadFile('${escapeHtml(file.name)}')" title="İndir" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-emerald-400 flex items-center justify-center transition">
-              <i class="fa-solid fa-download text-xs"></i>
-            </button>
-            <button onclick="openFilePreview('${escapeHtml(file.name)}')" title="Görüntüle / Düzenle" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-sky-400 flex items-center justify-center transition">
-              <i class="fa-solid fa-pen-to-square text-xs"></i>
-            </button>
-          `}
-          <button onclick="openRenameModal('${escapeHtml(file.name)}')" title="Yeniden Adlandır" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-amber-400 flex items-center justify-center transition">
-            <i class="fa-solid fa-pen text-xs"></i>
-          </button>
-          <button onclick="openChmodModal('${escapeHtml(file.name)}')" title="İzinler (CHMOD)" class="w-7 h-7 rounded hover:bg-slate-700 text-slate-300 hover:text-purple-400 flex items-center justify-center transition">
-            <i class="fa-solid fa-key text-xs"></i>
-          </button>
-          <button onclick="deleteItem('${escapeHtml(file.name)}', ${file.isDirectory})" title="Sil" class="w-7 h-7 rounded hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 flex items-center justify-center transition">
-            <i class="fa-solid fa-trash-can text-xs"></i>
-          </button>
-        </div>
-      </td>
-    `;
-
-    // Row click: click on row text to enter folder or view file
-    const nameSpan = tr.querySelector('td:nth-child(2) span');
-    nameSpan.addEventListener('click', () => {
-      if (file.isDirectory) {
-        changeDirectory(file.name);
-      } else {
-        openFilePreview(file.name);
-      }
-    });
-
-    // Right-click context menu on row
-    tr.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      showContextMenu(e, file);
-    });
-
-    tbody.appendChild(tr);
+    renderRemoteRow(tbody, file, localWritable);
   });
 }
 
@@ -525,9 +702,18 @@ async function openFilePreview(filename) {
   }
 
   // Else open in Code/Text Editor
+  window.currentEditingSource = 'remote';
+  window.currentLocalEditingHandle = null;
   currentEditingPath = filePath;
   document.getElementById('editorFilename').innerText = filename;
   document.getElementById('editorFilesize').innerText = 'Yükleniyor...';
+  const badge = document.getElementById('editorSourceBadge');
+  if (badge) {
+    badge.innerText = 'Uzak FTP';
+    badge.className = 'text-[10px] px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30';
+  }
+  const saveBtn = document.getElementById('editorSaveBtn');
+  if (saveBtn) saveBtn.disabled = false;
   document.getElementById('editorTextarea').value = 'İçerik sunucudan alınıyor...';
   openModal('editorModal');
 
@@ -548,16 +734,31 @@ async function openFilePreview(filename) {
   }
 }
 
-// Save Editor Content back to FTP
+// Save Editor Content back to FTP or Local Folder
 async function saveEditorContent() {
-  if (!currentSession || !currentEditingPath) return;
-
   const saveBtn = document.getElementById('editorSaveBtn');
   const originalHtml = saveBtn.innerHTML;
+  const content = document.getElementById('editorTextarea').value;
+
+  if (window.currentEditingSource === 'local') {
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Kaydediliyor...';
+    try {
+      await saveLocalEditorContent(content);
+      showToast('Dosya yerel klasöre kaydedildi.', 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.innerHTML = originalHtml;
+    }
+    return;
+  }
+
+  if (!currentSession || !currentEditingPath) return;
+
   saveBtn.disabled = true;
   saveBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Kaydediliyor...';
-
-  const content = document.getElementById('editorTextarea').value;
 
   try {
     const res = await fetch('/api/save', {
@@ -818,11 +1019,29 @@ async function uploadItems(rawItems) {
 
   const totalFiles = items.length;
   let uploadedCount = 0;
-  const BATCH_SIZE = 10; // Batch size
+  const MAX_FILES_PER_BATCH = 10;
+  const MAX_BYTES_PER_BATCH = 20 * 1024 * 1024; // Avoid Cloud Run 32MB limit
+
+  const batches = [];
+  let currentBatch = [];
+  let currentBatchBytes = 0;
+  for (const item of items) {
+    const fileSize = item.file?.size || 0;
+    if (
+      currentBatch.length >= MAX_FILES_PER_BATCH ||
+      (currentBatch.length > 0 && currentBatchBytes + fileSize > MAX_BYTES_PER_BATCH)
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBatchBytes = 0;
+    }
+    currentBatch.push(item);
+    currentBatchBytes += fileSize;
+  }
+  if (currentBatch.length > 0) batches.push(currentBatch);
 
   try {
-    for (let i = 0; i < items.length; i += BATCH_SIZE) {
-      const batch = items.slice(i, i + BATCH_SIZE);
+    for (const batch of batches) {
       const formData = new FormData();
       const relativePaths = [];
 
@@ -911,11 +1130,14 @@ async function resolveConflicts(items) {
       } else if (action === 'overwrite') {
         finalItems.push(sourceItem);
       } else if (action === 'overwrite_diff') {
-        // Overwrite if size differs
-        if (sourceItem.file.size !== conflict.size) {
+        const sizeDiff = sourceItem.file.size !== conflict.size;
+        const dateDiff = conflict.modifiedAt && sourceItem.file.lastModified
+          ? Math.abs(sourceItem.file.lastModified - new Date(conflict.modifiedAt).getTime()) > 60000
+          : false;
+        if (sizeDiff || dateDiff) {
           finalItems.push(sourceItem);
         } else {
-          console.log(`Boyutu aynı olduğu için atlandı: ${sourceItem.relativePath}`);
+          console.log(`Boyut ve tarih aynı olduğu için atlandı: ${sourceItem.relativePath}`);
         }
       } else if (action === 'rename') {
         const newRelPath = getRenamedPath(sourceItem.relativePath, allPaths);
@@ -944,10 +1166,15 @@ async function resolveConflicts(items) {
 }
 
 // Show FileZilla-style Overwrite Modal and await user decision
-function promptOverwriteModal(conflict, sourceItem, currentNum, totalNum) {
+function promptOverwriteModal(conflict, sourceItem, currentNum, totalNum, direction = 'upload') {
   return new Promise((resolve, reject) => {
     const modal = document.getElementById('overwriteModal');
     const filenameEl = document.getElementById('overwriteFilename');
+    const locationTextEl = document.getElementById('overwriteLocationText');
+    const targetIconEl = document.getElementById('overwriteTargetIcon');
+    const targetLabelEl = document.getElementById('overwriteTargetLabel');
+    const sourceIconEl = document.getElementById('overwriteSourceIcon');
+    const sourceLabelEl = document.getElementById('overwriteSourceLabel');
     const badgeEl = document.getElementById('overwriteCounterBadge');
     const targetSizeEl = document.getElementById('targetFileSize');
     const targetDateEl = document.getElementById('targetFileDate');
@@ -956,6 +1183,20 @@ function promptOverwriteModal(conflict, sourceItem, currentNum, totalNum) {
     const confirmBtn = document.getElementById('overwriteConfirmBtn');
     const cancelBtn = document.getElementById('overwriteCancelQueueBtn');
     const applyToAllCheck = document.getElementById('overwriteApplyToAll');
+
+    if (direction === 'download') {
+      if (locationTextEl) locationTextEl.innerText = 'hedef yerel klasörde zaten mevcut.';
+      if (targetIconEl) targetIconEl.className = 'fa-solid fa-laptop text-rose-400';
+      if (targetLabelEl) targetLabelEl.innerText = 'Mevcut Yerel Dosya (Hedef)';
+      if (sourceIconEl) sourceIconEl.className = 'fa-solid fa-server text-sky-400';
+      if (sourceLabelEl) sourceLabelEl.innerText = 'Uzak FTP Dosyası (Kaynak)';
+    } else {
+      if (locationTextEl) locationTextEl.innerText = 'hedef FTP dizininde zaten mevcut.';
+      if (targetIconEl) targetIconEl.className = 'fa-solid fa-server text-rose-400';
+      if (targetLabelEl) targetLabelEl.innerText = 'Mevcut Dosya (Hedef)';
+      if (sourceIconEl) sourceIconEl.className = 'fa-solid fa-cloud-arrow-up text-emerald-400';
+      if (sourceLabelEl) sourceLabelEl.innerText = 'Yeni Dosya (Kaynak)';
+    }
 
     filenameEl.innerText = conflict.relativePath;
     badgeEl.innerText = `${currentNum} / ${totalNum}`;
@@ -1024,14 +1265,20 @@ function setupDragAndDrop() {
     }, false);
   });
 
+  const isInternalDrag = (e) => {
+    const types = e.dataTransfer?.types;
+    if (!types) return false;
+    return Array.from(types).some(t => t === 'application/x-cloudftp-local' || t === 'application/x-cloudftp-remote');
+  };
+
   container.addEventListener('dragenter', (e) => {
-    if (!currentSession) return;
+    if (!currentSession || isInternalDrag(e)) return;
     dragCounter++;
     overlay.classList.remove('hidden');
   });
 
   container.addEventListener('dragleave', (e) => {
-    if (!currentSession) return;
+    if (!currentSession || isInternalDrag(e)) return;
     dragCounter--;
     if (dragCounter <= 0) {
       overlay.classList.add('hidden');
@@ -1040,7 +1287,7 @@ function setupDragAndDrop() {
   });
 
   container.addEventListener('drop', async (e) => {
-    if (!currentSession) return;
+    if (!currentSession || isInternalDrag(e)) return;
     dragCounter = 0;
     overlay.classList.add('hidden');
 
@@ -1138,17 +1385,23 @@ async function fetchLogs() {
   }
 }
 
-function renderLogs(logs) {
+function renderLogs(serverLogs) {
   const container = document.getElementById('logOutput');
   const countBadge = document.getElementById('logCountBadge');
-  countBadge.innerText = `${logs.length} kayıt`;
 
-  if (logs.length === 0) {
-    container.innerHTML = `<div class="text-slate-500">[Sistem hazır] FTP bağlantısı kuruldu.</div>`;
+  const combined = [...(serverLogs || []), ...(clientLogs || [])]
+    .filter(l => !logsClearedAtTs || !l.ts || l.ts > logsClearedAtTs)
+    .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+    .slice(-200);
+
+  countBadge.innerText = `${combined.length} kayıt`;
+
+  if (combined.length === 0) {
+    container.innerHTML = `<div class="text-slate-500">[Sistem hazır] ${currentSession ? 'FTP bağlantısı kuruldu.' : 'FTP bağlantısı bekleniyor...'}</div>`;
     return;
   }
 
-  container.innerHTML = logs.map(l => {
+  container.innerHTML = combined.map(l => {
     let colorClass = 'text-slate-400';
     let prefix = 'DURUM:';
 
@@ -1163,13 +1416,16 @@ function renderLogs(logs) {
       prefix = 'HATA:';
     }
 
-    return `<div class="${colorClass}"><span class="text-slate-600">[${l.timestamp}]</span> <span class="text-slate-500">${prefix}</span> ${escapeHtml(l.message)}</div>`;
+    const tsStr = l.ts ? new Date(l.ts).toLocaleTimeString('tr-TR') : l.timestamp;
+    return `<div class="${colorClass}"><span class="text-slate-600">[${tsStr}]</span> <span class="text-slate-500">${prefix}</span> ${escapeHtml(l.message)}</div>`;
   }).join('');
 
   container.scrollTop = container.scrollHeight;
 }
 
 function clearLogs() {
+  logsClearedAtTs = Date.now();
+  clientLogs = [];
   document.getElementById('logOutput').innerHTML = `<div class="text-slate-500">[Temizlendi]</div>`;
   document.getElementById('logCountBadge').innerText = '0 kayıt';
 }
@@ -1186,9 +1442,11 @@ function toggleConsoleHeight() {
   }
 }
 
-// Bookmarks / Saved Servers
-function loadBookmarks() {
+// ==================== BOOKMARKS & FILEZILLA XML INTEGRATION ====================
+
+function loadBookmarks(filterQuery = '') {
   const listEl = document.getElementById('bookmarksList');
+  if (!listEl) return;
   const raw = localStorage.getItem('cloudftp_bookmarks');
   let bookmarks = [];
   try {
@@ -1198,40 +1456,105 @@ function loadBookmarks() {
   }
 
   if (bookmarks.length === 0) {
-    listEl.innerHTML = `<div class="text-center py-4 text-xs text-slate-500">Henüz kayıtlı bir FTP sunucusu yok.</div>`;
+    listEl.innerHTML = `
+      <div class="text-center py-6 text-xs text-slate-500 font-sans space-y-2">
+        <i class="fa-solid fa-folder-open text-2xl text-slate-600 block"></i>
+        <div>Henüz kayıtlı bir FTP sunucusu yok.</div>
+        <div class="text-[11px] text-slate-400">
+          Yukarıdaki formu kullanarak kaydedebilir veya <button onclick="triggerFileZillaXmlUpload()" class="text-amber-400 hover:underline font-medium">FileZilla XML</button> yedeğinizi yükleyebilirsiniz.
+        </div>
+      </div>`;
     return;
   }
 
-  listEl.innerHTML = bookmarks.map((b, index) => `
-    <div class="flex items-center justify-between p-2.5 bg-slate-950 rounded-xl border border-slate-800 hover:border-slate-700 transition">
-      <div class="cursor-pointer flex-grow" onclick="useBookmark(${index})">
-        <div class="font-bold text-xs text-white flex items-center gap-1.5">
-          <i class="fa-solid fa-server text-sky-400 text-[10px]"></i>
-          ${escapeHtml(b.name)}
+  let displayList = bookmarks.map((b, originalIndex) => ({ ...b, originalIndex }));
+
+  if (filterQuery) {
+    const q = filterQuery.toLowerCase();
+    displayList = displayList.filter(b =>
+      (b.name && b.name.toLowerCase().includes(q)) ||
+      (b.host && b.host.toLowerCase().includes(q)) ||
+      (b.user && b.user.toLowerCase().includes(q)) ||
+      (b.remoteDir && b.remoteDir.toLowerCase().includes(q)) ||
+      (b.filezillaFolder && b.filezillaFolder.toLowerCase().includes(q)) ||
+      (b.filezillaLocalDir && b.filezillaLocalDir.toLowerCase().includes(q))
+    );
+  }
+
+  if (displayList.length === 0) {
+    listEl.innerHTML = `<div class="text-center py-4 text-xs text-slate-500">Aramanıza uygun kayıt bulunamadı ("${escapeHtml(filterQuery)}").</div>`;
+    return;
+  }
+
+  if (typeof preloadBookmarkHandles === 'function') {
+    preloadBookmarkHandles(bookmarks);
+  }
+
+  const mappingsMap = typeof getSavedMappingsMap === 'function' ? getSavedMappingsMap() : {};
+
+  listEl.innerHTML = displayList.map(b => {
+    const index = b.originalIndex;
+    const connKey = `${b.user || 'anonymous'}@${b.host}:${b.port || 21}`;
+    const mapped = mappingsMap[connKey];
+    const localName = b.localFolderName || mapped?.localFolderName || '';
+    const localBase = b.localBasePath !== undefined ? b.localBasePath : (mapped?.localBasePath || '');
+    const remoteBase = b.remoteDir || mapped?.remoteBasePath || '/';
+    const localDisplay = localName ? (localBase ? `${localName}/${localBase}` : localName) : (b.filezillaLocalDir || '');
+
+    return `
+      <div class="flex items-center justify-between p-2.5 bg-slate-950 rounded-xl border border-slate-800 hover:border-slate-700 transition gap-2 group">
+        <div class="cursor-pointer flex-grow min-w-0" onclick="connectBookmark(${index})" title="Bu sunucuya doğrudan bağlan">
+          <div class="font-bold text-xs text-white flex items-center gap-1.5 flex-wrap">
+            <i class="fa-solid fa-server text-sky-400 text-[10px]"></i>
+            <span class="truncate">${escapeHtml(b.name)}</span>
+            ${b.filezillaFolder ? `<span class="text-[9px] px-1.5 py-0.2 rounded bg-slate-800/90 text-amber-300 font-sans border border-slate-700/60" title="FileZilla Klasörü"><i class="fa-regular fa-folder mr-1"></i>${escapeHtml(b.filezillaFolder)}</span>` : ''}
+          </div>
+          <div class="text-[11px] text-slate-400 font-mono mt-0.5 truncate flex items-center gap-1.5 flex-wrap">
+            <span>${escapeHtml(b.user || 'anonymous')}@${escapeHtml(b.host)}:${b.port || 21}</span>
+            ${b.secure ? '<span class="text-emerald-400 text-[10px] font-semibold bg-emerald-950/40 px-1 rounded border border-emerald-800/40">FTPS</span>' : '<span class="text-slate-500 text-[10px]">FTP</span>'}
+            ${b.remoteDir ? `<span class="text-sky-400 text-[10px]">(${escapeHtml(b.remoteDir)})</span>` : ''}
+            ${b.password ? '<span class="text-amber-400 text-[10px]" title="Şifre kayıtlı"><i class="fa-solid fa-key"></i></span>' : '<span class="text-slate-600 text-[10px]" title="Şifre girilmeli"><i class="fa-regular fa-eye-slash"></i></span>'}
+          </div>
+          ${localDisplay ? `
+            <div class="text-[10px] text-emerald-400/90 font-mono mt-0.5 truncate">
+              <i class="fa-solid fa-folder-tree mr-1"></i>Yerel: ${escapeHtml(localDisplay)} ↔ ${escapeHtml(remoteBase)}
+            </div>
+          ` : ''}
         </div>
-        <div class="text-[11px] text-slate-400 font-mono mt-0.5">
-          ${escapeHtml(b.user)}@${escapeHtml(b.host)}:${b.port}
+        <div class="flex items-center gap-1 flex-none">
+          <button onclick="connectBookmark(${index})" title="Bu Sunucuya Doğrudan Bağlan" class="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold flex items-center gap-1 transition shadow-sm shadow-sky-600/30">
+            <i class="fa-solid fa-bolt text-[10px]"></i>
+            <span class="hidden sm:inline">Bağlan</span>
+          </button>
+          <button onclick="useBookmark(${index})" title="Forma Doldur (Bağlanmadan)" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] transition border border-slate-700">
+            Doldur
+          </button>
+          <button onclick="attachLocalFolderToBookmark(${index})" title="Yerel Klasör Bağla / Değiştir" class="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-emerald-400 hover:text-emerald-300 transition border border-slate-800">
+            <i class="fa-solid fa-folder-plus text-xs"></i>
+          </button>
+          <button onclick="deleteBookmark(${index})" title="Kaydı Sil" class="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-900 transition">
+            <i class="fa-solid fa-trash-can text-xs"></i>
+          </button>
         </div>
       </div>
-      <div class="flex items-center gap-1">
-        <button onclick="useBookmark(${index})" class="px-2.5 py-1 rounded bg-sky-600/30 hover:bg-sky-600 text-sky-300 hover:text-white text-[11px] font-medium transition">
-          Doldur
-        </button>
-        <button onclick="deleteBookmark(${index})" class="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-900 transition">
-          <i class="fa-solid fa-trash-can text-xs"></i>
-        </button>
-      </div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
-function saveCurrentBookmark() {
+function filterBookmarksList(query) {
+  loadBookmarks(query.trim());
+}
+
+async function saveCurrentBookmark() {
   const nameInput = document.getElementById('bookmarkNameInput');
+  const remoteDirInput = document.getElementById('bookmarkRemoteDirInput');
   const name = nameInput.value.trim() || 'FTP Sunucusu';
   const host = document.getElementById('hostInput').value.trim();
   const port = document.getElementById('portInput').value.trim() || '21';
   const user = document.getElementById('userInput').value.trim();
+  const password = document.getElementById('passwordInput')?.value || '';
   const secure = document.getElementById('secureCheck').checked;
+  const remoteDir = (remoteDirInput?.value.trim()) || (typeof syncState !== 'undefined' && syncState.mapped ? syncState.remoteBasePath : '');
 
   if (!host) {
     showToast('Lütfen önce bir sunucu adresi girin.', 'error');
@@ -1243,15 +1566,46 @@ function saveCurrentBookmark() {
     bookmarks = JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
   } catch (e) {}
 
-  bookmarks.push({ name, host, port, user, secure });
+  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `bm_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const hasPendingHandle = typeof pendingBookmarkLocalHandle !== 'undefined' && !!pendingBookmarkLocalHandle;
+  const localFolderName = hasPendingHandle ? pendingBookmarkLocalName : '';
+  const localBasePath = hasPendingHandle ? pendingBookmarkLocalBasePath : '';
+
+  bookmarks.push({ id, name, host, port, user, password, secure, remoteDir, localFolderName, localBasePath });
   localStorage.setItem('cloudftp_bookmarks', JSON.stringify(bookmarks));
 
+  if (hasPendingHandle && typeof HandlesDB !== 'undefined') {
+    const connKey = `${user || 'anonymous'}@${host}:${port}`;
+    await HandlesDB.save(`bookmark:${id}`, pendingBookmarkLocalHandle);
+    await HandlesDB.save(connKey, pendingBookmarkLocalHandle);
+    if (window.bookmarkHandlesCache) {
+      window.bookmarkHandlesCache.set(`bookmark:${id}`, pendingBookmarkLocalHandle);
+      window.bookmarkHandlesCache.set(connKey, pendingBookmarkLocalHandle);
+    }
+    const map = getSavedMappingsMap();
+    map[connKey] = {
+      key: connKey,
+      host,
+      port: parseInt(port, 10) || 21,
+      user: user || 'anonymous',
+      localFolderName,
+      localBasePath,
+      remoteBasePath: remoteDir || '/',
+      syncBrowsing: true,
+      compareEnabled: true,
+      updatedAt: Date.now()
+    };
+    saveMappingsMap(map);
+    if (typeof renderRecentLocalMappings === 'function') renderRecentLocalMappings();
+  }
+
   nameInput.value = '';
+  if (remoteDirInput) remoteDirInput.value = '';
   loadBookmarks();
   showToast('Bağlantı kaydedildi.', 'success');
 }
 
-function useBookmark(index) {
+async function useBookmark(index) {
   let bookmarks = [];
   try {
     bookmarks = JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
@@ -1263,23 +1617,537 @@ function useBookmark(index) {
   document.getElementById('hostInput').value = b.host;
   document.getElementById('portInput').value = b.port || 21;
   document.getElementById('userInput').value = b.user || '';
+  document.getElementById('passwordInput').value = b.password || '';
   document.getElementById('secureCheck').checked = b.secure || false;
-  document.getElementById('passwordInput').focus();
+
+  const connKey = `${b.user || 'anonymous'}@${b.host}:${b.port || 21}`;
+  const mappingsMap = typeof getSavedMappingsMap === 'function' ? getSavedMappingsMap() : {};
+  const savedMapping = mappingsMap[connKey];
+  pendingDefaultRemoteDir = b.remoteDir || savedMapping?.remoteBasePath || null;
 
   closeModal('bookmarksModal');
+  if (!b.password) {
+    document.getElementById('passwordInput').focus();
+  }
+
+  if (typeof activateBookmarkLocalMapping === 'function') {
+    await activateBookmarkLocalMapping(b);
+  }
+
   showToast(`"${b.name}" bilgileri forma aktarıldı.`, 'info');
 }
 
-function deleteBookmark(index) {
+async function connectBookmark(index) {
   let bookmarks = [];
   try {
     bookmarks = JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
   } catch (e) {}
 
+  const b = bookmarks[index];
+  if (!b) return;
+
+  document.getElementById('hostInput').value = b.host || '';
+  document.getElementById('portInput').value = b.port || 21;
+  document.getElementById('userInput').value = b.user || '';
+  document.getElementById('passwordInput').value = b.password || '';
+  document.getElementById('secureCheck').checked = Boolean(b.secure);
+
+  const connKey = `${b.user || 'anonymous'}@${b.host}:${b.port || 21}`;
+  const mappingsMap = typeof getSavedMappingsMap === 'function' ? getSavedMappingsMap() : {};
+  const savedMapping = mappingsMap[connKey];
+  pendingDefaultRemoteDir = b.remoteDir || savedMapping?.remoteBasePath || null;
+
+  if (typeof syncState !== 'undefined') {
+    if (b.syncBrowsing !== undefined) syncState.syncBrowsing = Boolean(b.syncBrowsing);
+    if (b.compareEnabled !== undefined) syncState.compareEnabled = Boolean(b.compareEnabled);
+  }
+
+  closeModal('bookmarksModal');
+
+  if (typeof activateBookmarkLocalMapping === 'function') {
+    await activateBookmarkLocalMapping(b);
+  }
+
+  showToast(`"${b.name}" sunucusuna bağlanılıyor...`, 'info');
+  const form = document.getElementById('connectForm');
+  if (form) {
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  }
+}
+
+async function deleteBookmark(index) {
+  let bookmarks = [];
+  try {
+    bookmarks = JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
+  } catch (e) {}
+
+  const removed = bookmarks[index];
   bookmarks.splice(index, 1);
   localStorage.setItem('cloudftp_bookmarks', JSON.stringify(bookmarks));
+  if (removed?.id && typeof HandlesDB !== 'undefined') {
+    await HandlesDB.remove(`bookmark:${removed.id}`);
+    window.bookmarkHandlesCache?.delete(`bookmark:${removed.id}`);
+  }
   loadBookmarks();
   showToast('Kayıt silindi.', 'info');
+}
+
+// ==================== FILEZILLA XML PARSER, IMPORT & EXPORT ====================
+
+function parseFileZillaRemoteDir(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  if (!s) return '';
+  if (s.startsWith('/')) return s;
+
+  // FileZilla serialized format: "1 0 [len] [segment] [len] [segment] ..."
+  const match = s.match(/^(\d+)\s+(\d+)\s*(.*)$/);
+  if (match) {
+    let rest = match[3].trim();
+    if (!rest) return '/';
+    const segments = [];
+    while (rest.length > 0) {
+      const lenMatch = rest.match(/^(\d+)\s+/);
+      if (!lenMatch) {
+        if (rest) segments.push(rest.trim());
+        break;
+      }
+      const len = parseInt(lenMatch[1], 10);
+      const startIdx = lenMatch[0].length;
+      const seg = rest.slice(startIdx, startIdx + len).trim();
+      if (seg) segments.push(seg);
+      rest = rest.slice(startIdx + len).trim();
+    }
+    return segments.length > 0 ? '/' + segments.join('/') : '/';
+  }
+
+  return s.startsWith('/') ? s : '/' + s;
+}
+
+function formatFileZillaRemoteDir(dir) {
+  if (!dir || dir === '/') return '1 0';
+  const clean = String(dir).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!clean) return '1 0';
+  const segments = clean.split('/');
+  let res = '1 0';
+  for (const seg of segments) {
+    if (seg) res += ` ${seg.length} ${seg}`;
+  }
+  return res;
+}
+
+function decodeFileZillaPassword(passNode) {
+  if (!passNode) return '';
+  const text = passNode.textContent?.trim() || '';
+  if (!text) return '';
+  const encoding = (passNode.getAttribute('encoding') || '').toLowerCase();
+  if (encoding === 'base64') {
+    try {
+      const binary = atob(text);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+      try {
+        return atob(text);
+      } catch (err) {
+        return text;
+      }
+    }
+  }
+  return text;
+}
+
+function encodeBase64Utf8(str) {
+  if (!str) return '';
+  try {
+    const bytes = new TextEncoder().encode(str);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch (e) {
+    return btoa(str);
+  }
+}
+
+function parseServerElement(el, folderPath = '') {
+  const host = el.querySelector(':scope > Host')?.textContent?.trim() || el.getAttribute('Host') || '';
+  if (!host) return null;
+
+  const portStr = el.querySelector(':scope > Port')?.textContent?.trim() || el.getAttribute('Port') || '21';
+  const port = parseInt(portStr, 10) || 21;
+
+  const rawProtocol = el.querySelector(':scope > Protocol')?.textContent?.trim() || el.getAttribute('Protocol') || '0';
+  // 0: FTP, 1: SFTP, 2: FTPS (explicit), 3: FTPS (implicit), 4: FTP over TLS
+  const isSecure = rawProtocol === '2' || rawProtocol === '3' || rawProtocol === '4' || port === 990;
+  const isSftp = rawProtocol === '1' || port === 22;
+
+  const user = el.querySelector(':scope > User')?.textContent?.trim() || el.getAttribute('User') || '';
+
+  const passEl = el.querySelector(':scope > Pass');
+  const password = passEl ? decodeFileZillaPassword(passEl) : (el.getAttribute('Pass') || '');
+
+  const nameTag = el.querySelector(':scope > Name')?.textContent?.trim() || el.getAttribute('Name') || '';
+  const name = nameTag || host;
+
+  const rawRemote = el.querySelector(':scope > RemoteDir')?.textContent?.trim() || '';
+  const remoteDir = parseFileZillaRemoteDir(rawRemote);
+
+  const localDir = el.querySelector(':scope > LocalDir')?.textContent?.trim() || '';
+  let localFolderName = '';
+  if (localDir) {
+    const normalized = localDir.replace(/\\/g, '/').replace(/\/+$/, '');
+    const segs = normalized.split('/');
+    localFolderName = segs[segs.length - 1] || '';
+  }
+
+  const syncBrowsing = el.querySelector(':scope > SyncBrowsing')?.textContent?.trim() === '1';
+  const compareEnabled = el.querySelector(':scope > DirectoryComparison')?.textContent?.trim() === '1';
+  const comments = el.querySelector(':scope > Comments')?.textContent?.trim() || '';
+
+  return {
+    host,
+    port,
+    user,
+    password,
+    secure: isSecure,
+    isSftp,
+    name,
+    remoteDir: (remoteDir === '/' ? '' : remoteDir),
+    filezillaFolder: folderPath || '',
+    filezillaLocalDir: localDir || '',
+    localFolderName,
+    syncBrowsing,
+    compareEnabled,
+    comments
+  };
+}
+
+function parseFileZillaXml(xmlString) {
+  if (!xmlString || typeof xmlString !== 'string') {
+    throw new Error('XML içeriği boş.');
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlString, 'application/xml');
+  const parserErr = doc.querySelector('parsererror');
+  if (parserErr) {
+    throw new Error('XML formatı geçersiz: ' + (parserErr.textContent || '').slice(0, 100));
+  }
+
+  const foundServers = [];
+
+  function walk(node, folderPath = '') {
+    const children = Array.from(node.children || []);
+    for (const child of children) {
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'server' || tag === 'site') {
+        const s = parseServerElement(child, folderPath);
+        if (s) foundServers.push(s);
+      } else if (tag === 'folder') {
+        const folderName = child.querySelector(':scope > Name')?.textContent?.trim() || child.getAttribute('Name') || 'Klasör';
+        const nextPath = folderPath ? `${folderPath} / ${folderName}` : folderName;
+        walk(child, nextPath);
+      } else if (tag === 'servers' || tag === 'sites' || tag === 'filezilla3' || tag === 'filezilla') {
+        walk(child, folderPath);
+      }
+    }
+  }
+
+  walk(doc.documentElement, '');
+
+  if (foundServers.length === 0) {
+    const allServers = doc.querySelectorAll('Server, Site');
+    allServers.forEach(el => {
+      const s = parseServerElement(el, '');
+      if (s) foundServers.push(s);
+    });
+  }
+
+  return foundServers;
+}
+
+function triggerFileZillaXmlUpload() {
+  const input = document.getElementById('filezillaXmlFileInput');
+  if (input) {
+    input.value = '';
+    input.click();
+  }
+}
+
+function handleFileZillaXmlUpload(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  readAndProcessFileZillaXmlFile(file);
+}
+
+function readAndProcessFileZillaXmlFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const xmlText = e.target.result;
+    try {
+      const servers = parseFileZillaXml(xmlText);
+      if (servers.length === 0) {
+        showToast('XML dosyasında kayıtlı bir FileZilla sunucusu bulunamadı.', 'warning');
+        return;
+      }
+      renderFileZillaImportPreview(servers, file.name);
+    } catch (err) {
+      showToast('FileZilla XML ayrıştırma hatası: ' + err.message, 'error');
+    }
+  };
+  reader.onerror = () => {
+    showToast('Dosya okunamadı.', 'error');
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+function renderFileZillaImportPreview(servers, fileName) {
+  window.pendingFzImportServers = servers;
+
+  const fileNameEl = document.getElementById('filezillaImportFileName');
+  const summaryEl = document.getElementById('filezillaImportSummary');
+  const listEl = document.getElementById('filezillaImportList');
+  const selectAllCb = document.getElementById('fzSelectAllCheckbox');
+
+  if (fileNameEl) {
+    fileNameEl.innerHTML = `<i class="fa-solid fa-file-code text-amber-400"></i> ${escapeHtml(fileName || 'FileZilla.xml')}`;
+  }
+  if (summaryEl) {
+    summaryEl.innerText = `${servers.length} adet FTP sunucusu bulundu`;
+  }
+  if (selectAllCb) selectAllCb.checked = true;
+
+  if (listEl) {
+    listEl.innerHTML = servers.map((s, i) => {
+      return `
+        <label class="flex items-start gap-2.5 p-2.5 bg-slate-950/70 hover:bg-slate-950 rounded-xl border border-slate-800/80 cursor-pointer transition">
+          <input type="checkbox" class="fz-import-item-cb mt-1 rounded bg-slate-800 border-slate-700 text-amber-500 focus:ring-0 cursor-pointer" data-idx="${i}" checked onchange="updateFzImportSelectedCount()">
+          <div class="flex-grow min-w-0">
+            <div class="font-bold text-xs text-white flex items-center gap-1.5 flex-wrap">
+              <i class="fa-solid fa-server text-sky-400 text-[10px]"></i>
+              <span class="truncate">${escapeHtml(s.name)}</span>
+              ${s.filezillaFolder ? `<span class="text-[9px] px-1.5 py-0.2 rounded bg-slate-800 text-amber-300 font-sans border border-slate-700/60"><i class="fa-regular fa-folder mr-1"></i>${escapeHtml(s.filezillaFolder)}</span>` : ''}
+              ${s.secure ? '<span class="text-[9px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-400 font-semibold border border-emerald-800/40">FTPS</span>' : '<span class="text-[9px] px-1 rounded text-slate-500">FTP</span>'}
+              ${s.isSftp ? '<span class="text-[9px] px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300 border border-indigo-800/40">SFTP</span>' : ''}
+            </div>
+            <div class="text-[11px] text-slate-400 font-mono mt-0.5 truncate flex items-center gap-1.5 flex-wrap">
+              <span>${escapeHtml(s.user || 'anonymous')}@${escapeHtml(s.host)}:${s.port}</span>
+              ${s.remoteDir ? `<span class="text-sky-400 text-[10px]">(${escapeHtml(s.remoteDir)})</span>` : ''}
+              ${s.password ? '<span class="text-amber-400 text-[10px]" title="Şifre kayıtlı"><i class="fa-solid fa-key"></i> Şifre var</span>' : '<span class="text-slate-600 text-[10px]" title="Şifre yok"><i class="fa-regular fa-eye-slash"></i> Şifresiz</span>'}
+            </div>
+            ${s.filezillaLocalDir ? `
+              <div class="text-[10px] text-slate-500 truncate mt-0.5">
+                <i class="fa-regular fa-folder mr-1"></i>${escapeHtml(s.filezillaLocalDir)}
+              </div>
+            ` : ''}
+          </div>
+        </label>
+      `;
+    }).join('');
+  }
+
+  updateFzImportSelectedCount();
+  openModal('filezillaImportModal');
+}
+
+function toggleFzImportSelectAll(masterCb) {
+  const checkboxes = document.querySelectorAll('.fz-import-item-cb');
+  checkboxes.forEach(cb => {
+    cb.checked = masterCb.checked;
+  });
+  updateFzImportSelectedCount();
+}
+
+function updateFzImportSelectedCount() {
+  const checkboxes = document.querySelectorAll('.fz-import-item-cb');
+  let checkedCount = 0;
+  checkboxes.forEach(cb => {
+    if (cb.checked) checkedCount++;
+  });
+  const label = document.getElementById('fzSelectedCountLabel');
+  if (label) {
+    label.innerText = `${checkedCount}/${checkboxes.length} seçildi`;
+  }
+  const submitBtn = document.getElementById('submitFzImportBtn');
+  if (submitBtn) {
+    submitBtn.disabled = checkedCount === 0;
+    submitBtn.classList.toggle('opacity-50', checkedCount === 0);
+  }
+}
+
+function executeFileZillaImport() {
+  if (!window.pendingFzImportServers || window.pendingFzImportServers.length === 0) {
+    closeModal('filezillaImportModal');
+    return;
+  }
+
+  const checkboxes = document.querySelectorAll('.fz-import-item-cb');
+  const selectedIndices = [];
+  checkboxes.forEach(cb => {
+    if (cb.checked) {
+      const idx = parseInt(cb.dataset.idx, 10);
+      if (!isNaN(idx)) selectedIndices.push(idx);
+    }
+  });
+
+  if (selectedIndices.length === 0) {
+    showToast('Lütfen içe aktarılacak en az bir sunucu seçin.', 'warning');
+    return;
+  }
+
+  const replaceMode = document.querySelector('input[name="fzImportMode"]:checked')?.value === 'replace';
+
+  let currentBookmarks = [];
+  try {
+    currentBookmarks = replaceMode ? [] : JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
+  } catch (e) {
+    currentBookmarks = [];
+  }
+
+  const mappingsMap = typeof getSavedMappingsMap === 'function' ? getSavedMappingsMap() : {};
+  let addedCount = 0;
+
+  selectedIndices.forEach(idx => {
+    const s = window.pendingFzImportServers[idx];
+    if (!s) return;
+
+    const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `fz_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+    const bm = {
+      id,
+      name: s.name,
+      host: s.host,
+      port: s.port,
+      user: s.user,
+      password: s.password || '',
+      secure: s.secure,
+      remoteDir: s.remoteDir || '',
+      localFolderName: s.localFolderName || '',
+      localBasePath: '',
+      filezillaFolder: s.filezillaFolder || '',
+      filezillaLocalDir: s.filezillaLocalDir || '',
+      syncBrowsing: s.syncBrowsing,
+      compareEnabled: s.compareEnabled,
+      comments: s.comments || ''
+    };
+
+    currentBookmarks.push(bm);
+    addedCount++;
+
+    if (s.localFolderName || s.remoteDir) {
+      const connKey = `${s.user || 'anonymous'}@${s.host}:${s.port || 21}`;
+      if (!mappingsMap[connKey]) {
+        mappingsMap[connKey] = {
+          key: connKey,
+          host: s.host,
+          port: s.port || 21,
+          user: s.user || 'anonymous',
+          localFolderName: s.localFolderName || '',
+          localBasePath: '',
+          remoteBasePath: s.remoteDir || '/',
+          syncBrowsing: s.syncBrowsing,
+          compareEnabled: s.compareEnabled,
+          updatedAt: Date.now()
+        };
+      }
+    }
+  });
+
+  localStorage.setItem('cloudftp_bookmarks', JSON.stringify(currentBookmarks));
+  if (typeof saveMappingsMap === 'function') {
+    saveMappingsMap(mappingsMap);
+  }
+  if (typeof renderRecentLocalMappings === 'function') {
+    renderRecentLocalMappings();
+  }
+
+  closeModal('filezillaImportModal');
+  loadBookmarks();
+  openModal('bookmarksModal');
+
+  showToast(`${addedCount} adet FileZilla sunucusu başarıyla içe aktarıldı!`, 'success');
+  addClientLog('system', `${addedCount} adet FileZilla sunucu kaydı içe aktarıldı.`);
+}
+
+function exportToFileZillaXml() {
+  let bookmarks = [];
+  try {
+    bookmarks = JSON.parse(localStorage.getItem('cloudftp_bookmarks') || '[]');
+  } catch (e) {}
+
+  if (bookmarks.length === 0) {
+    showToast('Dışa aktarılacak kayıtlı sunucu bulunamadı.', 'warning');
+    return;
+  }
+
+  function escapeXml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+
+  const xmlServers = bookmarks.map(b => {
+    const passXml = b.password
+      ? `<Pass encoding="base64">${encodeBase64Utf8(b.password)}</Pass>`
+      : '<Pass/>';
+    const logontype = b.password ? 1 : (b.user ? 2 : 0);
+    const protocol = b.secure ? 2 : 0;
+    const remoteDirStr = formatFileZillaRemoteDir(b.remoteDir);
+    const localDirStr = escapeXml(b.filezillaLocalDir || (b.localFolderName ? `/${b.localFolderName}` : ''));
+
+    return `        <Server>
+            <Host>${escapeXml(b.host)}</Host>
+            <Port>${b.port || 21}</Port>
+            <Protocol>${protocol}</Protocol>
+            <Type>0</Type>
+            <User>${escapeXml(b.user || '')}</User>
+            ${passXml}
+            <Logontype>${logontype}</Logontype>
+            <TimezoneOffset>0</TimezoneOffset>
+            <PasvMode>MODE_DEFAULT</PasvMode>
+            <MaximumMultipleConnections>0</MaximumMultipleConnections>
+            <EncodingType>Auto</EncodingType>
+            <BypassProxy>0</BypassProxy>
+            <Name>${escapeXml(b.name)}</Name>
+            <Comments>${escapeXml(b.comments || '')}</Comments>
+            <LocalDir>${localDirStr}</LocalDir>
+            <RemoteDir>${remoteDirStr}</RemoteDir>
+            <SyncBrowsing>${b.syncBrowsing ? 1 : 0}</SyncBrowsing>
+            <DirectoryComparison>${b.compareEnabled ? 1 : 0}</DirectoryComparison>
+        </Server>`;
+  }).join('\n');
+
+  const xmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<FileZilla3 version="3.66.5" platform="windows">
+    <Servers>
+${xmlServers}
+    </Servers>
+</FileZilla3>
+`;
+
+  const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `FileZilla_Export_${new Date().toISOString().slice(0, 10)}.xml`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  showToast(`${bookmarks.length} adet sunucu FileZilla XML olarak indirildi.`, 'success');
 }
 
 // Helper: Public Test FTP Server Credentials from https://dlptest.com/ftp-test/
@@ -1354,7 +2222,7 @@ function toggleSelectAll(masterCheckbox) {
   checkboxes.forEach(cb => {
     cb.checked = masterCheckbox.checked;
     const row = cb.closest('tr');
-    const nameSpan = row?.querySelector('td:nth-child(2) span');
+    const nameSpan = row?.querySelector('.remote-name-link');
     const name = nameSpan?.getAttribute('title');
     if (masterCheckbox.checked && name) {
       selectedNames.add(name);
@@ -1380,7 +2248,13 @@ function clearSelection() {
 function updateBulkActionBar() {
   const bar = document.getElementById('bulkActionBar');
   const countText = document.getElementById('selectedCountText');
+  const bulkLocalBtn = document.getElementById('bulkDownloadToLocalBtn');
   if (!bar) return;
+
+  if (bulkLocalBtn) {
+    const canWriteLocal = typeof canWriteToLocal === 'function' && canWriteToLocal();
+    bulkLocalBtn.classList.toggle('hidden', !canWriteLocal);
+  }
 
   if (selectedNames.size > 0) {
     countText.innerText = `${selectedNames.size} öğe seçildi`;
@@ -1388,6 +2262,33 @@ function updateBulkActionBar() {
   } else {
     bar.classList.add('hidden');
   }
+}
+
+function setRemoteSelectionFromSet(newSet) {
+  selectedNames = new Set(newSet);
+  const tbody = document.getElementById('fileListBody');
+  const master = document.getElementById('selectAllCheckbox');
+  const rows = tbody ? tbody.querySelectorAll('tr') : [];
+  let totalVisible = 0;
+  let checkedVisible = 0;
+
+  rows.forEach(row => {
+    const cb = row.querySelector('.row-checkbox');
+    const name = row.querySelector('.remote-name-link')?.getAttribute('title');
+    if (!cb || !name) return;
+    totalVisible++;
+    const isSel = selectedNames.has(name);
+    cb.checked = isSel;
+    if (isSel) checkedVisible++;
+    row.classList.toggle('bg-sky-950/40', isSel);
+    if (isSel) row.classList.remove('hover:bg-slate-800/40');
+    else row.classList.add('hover:bg-slate-800/40');
+  });
+
+  if (master) {
+    master.checked = totalVisible > 0 && checkedVisible === totalVisible;
+  }
+  updateBulkActionBar();
 }
 
 async function deleteSelectedItems() {
@@ -1432,37 +2333,48 @@ function showContextMenu(e, file) {
   const itemsContainer = document.getElementById('contextMenuItems');
   if (!menu || !itemsContainer) return;
 
-  const safeName = escapeHtml(file.name);
+  const safeArg = escapeAttrArg(file.name);
+  const canWriteLocal = typeof canWriteToLocal === 'function' && canWriteToLocal();
   let html = '';
 
   if (file.isDirectory) {
     html += `
-      <button onclick="changeDirectory('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <button onclick="changeDirectory('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
         <i class="fa-solid fa-folder-open text-amber-400 w-4"></i> Klasörü Aç
       </button>
-      <button onclick="downloadFolderAsZip('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      ${canWriteLocal ? `
+        <button onclick="downloadRemoteItemToLocal('${safeArg}', true); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-emerald-300 flex items-center gap-2 transition">
+          <i class="fa-solid fa-arrow-left text-emerald-400 w-4"></i> Yerel Klasöre İndir
+        </button>
+      ` : ''}
+      <button onclick="downloadFolderAsZip('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
         <i class="fa-solid fa-file-zipper text-emerald-400 w-4"></i> ZIP Olarak İndir
       </button>`;
   } else {
     html += `
-      <button onclick="openFilePreview('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      <button onclick="openFilePreview('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
         <i class="fa-solid fa-pen-to-square text-sky-400 w-4"></i> Düzenle / Önizle
       </button>
-      <button onclick="downloadFile('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+      ${canWriteLocal ? `
+        <button onclick="downloadRemoteItemToLocal('${safeArg}', false); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-emerald-300 flex items-center gap-2 transition">
+          <i class="fa-solid fa-arrow-left text-emerald-400 w-4"></i> Yerel Klasöre İndir
+        </button>
+      ` : ''}
+      <button onclick="downloadFile('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
         <i class="fa-solid fa-download text-emerald-400 w-4"></i> İndir
       </button>`;
   }
 
   html += `
     <div class="my-1 border-t border-slate-800"></div>
-    <button onclick="openRenameModal('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+    <button onclick="openRenameModal('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
       <i class="fa-solid fa-pen text-amber-400 w-4"></i> Yeniden Adlandır
     </button>
-    <button onclick="openChmodModal('${safeName}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
+    <button onclick="openChmodModal('${safeArg}'); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 flex items-center gap-2 transition">
       <i class="fa-solid fa-key text-purple-400 w-4"></i> İzinler (CHMOD)
     </button>
     <div class="my-1 border-t border-slate-800"></div>
-    <button onclick="deleteItem('${safeName}', ${file.isDirectory}); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 flex items-center gap-2 transition">
+    <button onclick="deleteItem('${safeArg}', ${file.isDirectory}); hideContextMenu()" class="w-full text-left px-3 py-1.5 rounded-lg hover:bg-rose-950/60 text-rose-400 flex items-center gap-2 transition">
       <i class="fa-solid fa-trash-can w-4"></i> Sil
     </button>
   `;
@@ -1522,6 +2434,7 @@ function sortFiles(field) {
   // Update icons
   ['name', 'size', 'modifiedAt'].forEach(col => {
     const icon = document.getElementById(`sort-${col}`);
+    if (!icon) return;
     if (col === field) {
       icon.className = `fa-solid ${sortDirection === 'asc' ? 'fa-sort-up' : 'fa-sort-down'} ml-1 text-sky-400`;
     } else {
@@ -1529,16 +2442,42 @@ function sortFiles(field) {
     }
   });
 
-  renderFileList(document.getElementById('searchInput').value.trim());
+  if (typeof syncState !== 'undefined' && syncState.compareEnabled && typeof localState !== 'undefined' && localState.provider && currentSession) {
+    localState.sortField = sortField;
+    localState.sortDirection = sortDirection;
+    ['name', 'size', 'modifiedAt'].forEach(col => {
+      const icon = document.getElementById(`local-sort-${col}`);
+      if (!icon) return;
+      if (col === sortField) {
+        icon.className = `fa-solid ${sortDirection === 'asc' ? 'fa-sort-up' : 'fa-sort-down'} ml-1 text-emerald-400`;
+      } else {
+        icon.className = 'fa-solid fa-sort ml-1 text-slate-600';
+      }
+    });
+    renderFileList(document.getElementById('searchInput')?.value.trim() || '');
+    if (typeof renderLocalFileList === 'function') {
+      renderLocalFileList(document.getElementById('localSearchInput')?.value.trim() || '');
+    }
+  } else {
+    renderFileList(document.getElementById('searchInput')?.value.trim() || '');
+  }
 }
 
 // Modal Helpers
 function openModal(id) {
   document.getElementById(id).classList.remove('hidden');
+  if (id === 'bookmarksModal') {
+    if (typeof resetBookmarkLocalFolderDraft === 'function') resetBookmarkLocalFolderDraft();
+    if (typeof loadBookmarks === 'function') loadBookmarks();
+  }
 }
 
 function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
+  if (id === 'imagePreviewModal' && typeof localPreviewBlobUrl !== 'undefined' && localPreviewBlobUrl) {
+    URL.revokeObjectURL(localPreviewBlobUrl);
+    localPreviewBlobUrl = null;
+  }
 }
 
 // Toast Notifications
@@ -1604,5 +2543,14 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+function escapeAttrArg(str) {
+  if (!str) return '';
+  return escapeHtml(
+    String(str)
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'")
+  );
 }
 
